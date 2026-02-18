@@ -139,13 +139,14 @@ Default: `global`
 
 The default filter to use when searching
 
-| Mode             | Description                                                  |
-| ---------------- | ------------------------------------------------------------ |
-| global (default) | Search history from all hosts, all sessions, all directories |
-| host             | Search history just from this host                           |
-| session          | Search history just from the current session                 |
-| directory        | Search history just from the current directory (global)      |
-| workspace        | Search history just from the current git repository (>17.0)  |
+| Mode             | Description                                                                          |
+|------------------|--------------------------------------------------------------------------------------|
+| global (default) | Search from the full history                                                         |
+| host             | Search history from this host                                                        |
+| session          | Search history from the current session                                              |
+| directory        | Search history from the current directory                                            |
+| workspace        | Search history from the current git repository                                       |
+| session-preload  | Search from the current session and the global history from before the session start |
 
 Filter modes can still be toggled via ctrl-r
 
@@ -422,8 +423,6 @@ Atuin version: >= 17.0
 
 Default: `false`
 
-Not supported by NuShell presently
-
 When set to true, Atuin will default to immediately executing a command rather
 than the user having to press enter twice. Pressing tab will return to the
 shell and give the user a chance to edit.
@@ -619,13 +618,32 @@ Default: `true`
 
 Exits the TUI when scrolling left while the cursor is at the start of the line.
 
-### `exit_past_line_end`
+### `accept_past_line_end`
 
 Atuin version: >= 18.5
 
 Default: `true`
 
-Exits the TUI when scrolling right while the cursor is at the end of the line.
+The right arrow key performs the same functionality as Tab and copies the selected line to the command line to be
+modified.
+
+### `accept_past_line_start`
+
+Atuin version: >= 18.9
+
+Default: `false`
+
+The left arrow key performs the same functionality as Tab and copies the selected line to the command line to be
+modified.
+
+### `accept_with_backspace`
+
+Atuin version: >= 18.9
+
+Default: `false`
+
+The backspace key performs the same functionality as Tab and copies the selected line to the command line to be
+modified.
 
 ## preview
 
@@ -668,6 +686,18 @@ Add the new section to the bottom of your config file
 enabled = true
 ```
 
+### autostart
+
+Default: `false`
+
+Automatically start and manage the daemon when needed.
+This is not compatible with `systemd_socket = true`.
+If a legacy experimental daemon is already running, restart it manually once before using autostart.
+
+```toml
+autostart = false
+```
+
 ### sync_frequency
 
 Default: `300`
@@ -689,6 +719,16 @@ socket_path = "~/.local/share/atuin/atuin.sock"
 Where to bind a unix socket for client -> daemon communication
 
 If XDG_RUNTIME_DIR is available, then we use this directory instead.
+
+### pidfile_path
+
+Default:
+
+```toml
+pidfile_path = "~/.local/share/atuin/atuin-daemon.pid"
+```
+
+Path to the daemon pidfile used for process coordination.
 
 ### systemd_socket
 

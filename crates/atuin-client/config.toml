@@ -231,12 +231,16 @@ enter_accept = true
 [keys]
 # Defaults to true. If disabled, using the up/down key won't exit the TUI when scrolled past the first/last entry.
 # scroll_exits = true
+
 # Defaults to true. The left arrow key will exit the TUI when scrolling before the first character
 # exit_past_line_start = true
+
 # Defaults to true. The right arrow key performs the same functionality as Tab and copies the selected line to the command line to be modified.
 # accept_past_line_end = true
+
 # Defaults to false. The left arrow key performs the same functionality as Tab and copies the selected line to the command line to be modified.
 # accept_past_line_start = false
+
 # Defaults to false. The backspace key performs the same functionality as Tab and copies the selected line to the command line to be modified when at the start of the line.
 # accept_with_backspace = false
 
@@ -255,8 +259,12 @@ records = true
 # strategy = "auto"
 
 [daemon]
-## Enables using the daemon to sync. Requires the daemon to be running in the background. Start it with `atuin daemon`
+## Enables using the daemon to sync.
 # enabled = false
+
+## Automatically start and manage the daemon when needed.
+## Not compatible with `systemd_socket = true`.
+# autostart = false
 
 ## How often the daemon should sync in seconds
 # sync_frequency = 300
@@ -265,6 +273,10 @@ records = true
 ## linux/mac: ~/.local/share/atuin/atuin.sock
 ## windows: Not Supported
 # socket_path = "~/.local/share/atuin/atuin.sock"
+
+## The daemon pidfile used for lifecycle management.
+## Defaults to the Atuin data directory.
+# pidfile_path = "~/.local/share/atuin/atuin-daemon.pid"
 
 ## Use systemd socket activation rather than opening the given path (the path must still be correct for the client)
 ## linux: false
@@ -301,8 +313,8 @@ records = true
 ## When enabled and running inside tmux, Atuin will use a popup window for interactive search.
 ## Set to false to disable the popup.
 ## This can also be controlled with the ATUIN_TMUX_POPUP environment variable.
-## Note: tmux popup is currently supported in zsh, bash, and fish shells.
-# enabled = true
+## Note: The tmux popup is currently supported in zsh, bash, and fish shells. This currently doesn't work with iTerm native tmux integration.
+# enabled = false
 
 ## Width of the tmux popup window
 ## Can be a percentage, or integer (e.g. "100" means 100 characters wide)

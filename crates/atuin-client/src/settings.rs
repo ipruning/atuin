@@ -1,7 +1,5 @@
-use std::{
-    collections::HashMap, convert::TryFrom, fmt, io::prelude::*, path::PathBuf, str::FromStr,
-    sync::OnceLock,
-};
+use std::{collections::HashMap, fmt, io::prelude::*, path::PathBuf, str::FromStr, sync::OnceLock};
+use tokio::sync::OnceCell;
 
 use atuin_common::record::HostId;
 use atuin_common::utils;
@@ -16,24 +14,18 @@ use regex::RegexSet;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_with::DeserializeFromStr;
-use time::{
-    OffsetDateTime, UtcOffset,
-    format_description::{FormatItem, well_known::Rfc3339},
-    macros::format_description,
-};
-use uuid::Uuid;
+use time::{OffsetDateTime, UtcOffset, format_description::FormatItem, macros::format_description};
 
 pub const HISTORY_PAGE_SIZE: i64 = 100;
-pub const LAST_SYNC_FILENAME: &str = "last_sync_time";
-pub const LAST_VERSION_CHECK_FILENAME: &str = "last_version_check_time";
-pub const LATEST_VERSION_FILENAME: &str = "latest_version";
-pub const HOST_ID_FILENAME: &str = "host_id";
 static EXAMPLE_CONFIG: &str = include_str!("../config.toml");
 
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+static META_CONFIG: OnceLock<(String, f64)> = OnceLock::new();
+static META_STORE: OnceCell<crate::meta::MetaStore> = OnceCell::const_new();
 
 mod dotfiles;
 mod kv;
+pub(crate) mod meta;
 mod scripts;
 
 #[derive(Clone, Debug, Deserialize, Copy, ValueEnum, PartialEq, Serialize)]
@@ -350,6 +342,80 @@ pub struct Keys {
     pub prefix: String,
 }
 
+impl Keys {
+    /// The standard default values for all `[keys]` options.
+    /// These match the config defaults set in `builder_with_data_dir()`.
+    pub fn standard_defaults() -> Self {
+        Keys {
+            scroll_exits: true,
+            exit_past_line_start: true,
+            accept_past_line_end: true,
+            accept_past_line_start: false,
+            accept_with_backspace: false,
+            prefix: "a".to_string(),
+        }
+    }
+
+    /// Returns true if any value differs from the standard defaults.
+    pub fn has_non_default_values(&self) -> bool {
+        let d = Self::standard_defaults();
+        self.scroll_exits != d.scroll_exits
+            || self.exit_past_line_start != d.exit_past_line_start
+            || self.accept_past_line_end != d.accept_past_line_end
+            || self.accept_past_line_start != d.accept_past_line_start
+            || self.accept_with_backspace != d.accept_with_backspace
+            || self.prefix != d.prefix
+    }
+}
+
+/// A single rule within a conditional keybinding config.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct KeyRuleConfig {
+    /// Optional condition expression (e.g. "cursor-at-start", "input-empty && no-results").
+    /// If absent, the rule always matches.
+    #[serde(default)]
+    pub when: Option<String>,
+    /// The action to perform (e.g. "exit", "cursor-left", "accept").
+    pub action: String,
+}
+
+/// A keybinding config value: either a simple action string or an ordered list of conditional rules.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum KeyBindingConfig {
+    /// Simple unconditional binding: `"ctrl-c" = "return-original"`
+    Simple(String),
+    /// Conditional binding: `"left" = [{ when = "cursor-at-start", action = "exit" }, { action = "cursor-left" }]`
+    Rules(Vec<KeyRuleConfig>),
+}
+
+/// User-facing keymap configuration. Each mode maps key strings to bindings.
+/// Keys present here override the defaults for that key; unmentioned keys keep defaults.
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+pub struct KeymapConfig {
+    #[serde(default)]
+    pub emacs: HashMap<String, KeyBindingConfig>,
+    #[serde(default, rename = "vim-normal")]
+    pub vim_normal: HashMap<String, KeyBindingConfig>,
+    #[serde(default, rename = "vim-insert")]
+    pub vim_insert: HashMap<String, KeyBindingConfig>,
+    #[serde(default)]
+    pub inspector: HashMap<String, KeyBindingConfig>,
+    #[serde(default)]
+    pub prefix: HashMap<String, KeyBindingConfig>,
+}
+
+impl KeymapConfig {
+    /// Returns true if no keybinding overrides are configured in any mode.
+    pub fn is_empty(&self) -> bool {
+        self.emacs.is_empty()
+            && self.vim_normal.is_empty()
+            && self.vim_insert.is_empty()
+            && self.inspector.is_empty()
+            && self.prefix.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Preview {
     pub strategy: PreviewStrategy,
@@ -370,15 +436,21 @@ pub struct Theme {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Daemon {
     /// Use the daemon to sync
-    /// If enabled, requires a running daemon with `atuin daemon`
+    /// If enabled, history hooks are routed through the daemon.
     #[serde(alias = "enable")]
     pub enabled: bool,
+
+    /// Automatically start and manage a local daemon when needed.
+    pub autostart: bool,
 
     /// The daemon will handle sync on an interval. How often to sync, in seconds.
     pub sync_frequency: u64,
 
     /// The path to the unix socket used by the daemon
     pub socket_path: String,
+
+    /// Path to the daemon pidfile used for process coordination.
+    pub pidfile_path: String,
 
     /// Use a socket passed via systemd's socket activation protocol, instead of the path
     pub systemd_socket: bool,
@@ -427,8 +499,10 @@ impl Default for Daemon {
     fn default() -> Self {
         Self {
             enabled: false,
+            autostart: false,
             sync_frequency: 300,
             socket_path: "".to_string(),
+            pidfile_path: "".to_string(),
             systemd_socket: false,
             tcp_port: 8889,
         }
@@ -453,7 +527,7 @@ impl Default for Search {
 impl Default for Tmux {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             width: "80%".to_string(),
             height: "60%".to_string(),
         }
@@ -509,7 +583,13 @@ impl UiColumnType {
             UiColumnType::Directory => 20,
             UiColumnType::Host => 15,
             UiColumnType::User => 10,
-            UiColumnType::Exit => 3,
+            UiColumnType::Exit => {
+                if cfg!(windows) {
+                    11 // 32-bit integer on Windows: "-1978335212"
+                } else {
+                    3 // Usually a byte on Unix
+                }
+            }
             UiColumnType::Command => 0, // Expands to fill
         }
     }
@@ -662,12 +742,17 @@ pub struct Settings {
     pub style: Style,
     pub auto_sync: bool,
     pub update_check: bool,
+
+    /// The address of the Atuin Hub. Used for Hub-specific features like AI.
+    pub hub_address: String,
+
+    /// The sync address for atuin.
     pub sync_address: String,
+
     pub sync_frequency: String,
     pub db_path: String,
     pub record_store_path: String,
     pub key_path: String,
-    pub session_path: String,
     pub search_mode: SearchMode,
     pub filter_mode: Option<FilterMode>,
     pub filter_mode_shell_up_key_binding: Option<FilterMode>,
@@ -720,6 +805,9 @@ pub struct Settings {
     pub keys: Keys,
 
     #[serde(default)]
+    pub keymap: KeymapConfig,
+
+    #[serde(default)]
     pub preview: Preview,
 
     #[serde(default)]
@@ -745,6 +833,9 @@ pub struct Settings {
 
     #[serde(default)]
     pub tmux: Tmux,
+
+    #[serde(default)]
+    pub meta: meta::Settings,
 }
 
 impl Settings {
@@ -759,92 +850,48 @@ impl Settings {
             .expect("Could not deserialize config")
     }
 
-    fn effective_data_dir() -> PathBuf {
+    pub(crate) fn effective_data_dir() -> PathBuf {
         DATA_DIR
             .get()
             .cloned()
             .unwrap_or_else(atuin_common::utils::data_dir)
     }
 
-    fn save_to_data_dir(filename: &str, value: &str) -> Result<()> {
-        let data_dir = Self::effective_data_dir();
-        let data_dir = data_dir.as_path();
+    // -- Meta store: lazily initialized on first access --
 
-        let path = data_dir.join(filename);
-
-        fs_err::write(path, value)?;
-
-        Ok(())
+    pub async fn meta_store() -> Result<&'static crate::meta::MetaStore> {
+        META_STORE
+            .get_or_try_init(|| async {
+                let (db_path, timeout) = META_CONFIG.get().ok_or_else(|| {
+                    eyre!("meta store config not set — Settings::new() has not been called")
+                })?;
+                crate::meta::MetaStore::new(db_path, *timeout).await
+            })
+            .await
     }
 
-    fn read_from_data_dir(filename: &str) -> Option<String> {
-        let data_dir = Self::effective_data_dir();
-        let data_dir = data_dir.as_path();
-
-        let path = data_dir.join(filename);
-
-        if !path.exists() {
-            return None;
-        }
-
-        let value = fs_err::read_to_string(path);
-
-        value.ok()
+    pub async fn host_id() -> Result<HostId> {
+        Self::meta_store().await?.host_id().await
     }
 
-    fn save_current_time(filename: &str) -> Result<()> {
-        Settings::save_to_data_dir(
-            filename,
-            OffsetDateTime::now_utc().format(&Rfc3339)?.as_str(),
-        )?;
-
-        Ok(())
+    pub async fn last_sync() -> Result<OffsetDateTime> {
+        Self::meta_store().await?.last_sync().await
     }
 
-    fn load_time_from_file(filename: &str) -> Result<OffsetDateTime> {
-        let value = Settings::read_from_data_dir(filename);
-
-        match value {
-            Some(v) => Ok(OffsetDateTime::parse(v.as_str(), &Rfc3339)?),
-            None => Ok(OffsetDateTime::UNIX_EPOCH),
-        }
+    pub async fn save_sync_time() -> Result<()> {
+        Self::meta_store().await?.save_sync_time().await
     }
 
-    pub fn save_sync_time() -> Result<()> {
-        Settings::save_current_time(LAST_SYNC_FILENAME)
+    pub async fn last_version_check() -> Result<OffsetDateTime> {
+        Self::meta_store().await?.last_version_check().await
     }
 
-    pub fn save_version_check_time() -> Result<()> {
-        Settings::save_current_time(LAST_VERSION_CHECK_FILENAME)
+    pub async fn save_version_check_time() -> Result<()> {
+        Self::meta_store().await?.save_version_check_time().await
     }
 
-    pub fn last_sync() -> Result<OffsetDateTime> {
-        Settings::load_time_from_file(LAST_SYNC_FILENAME)
-    }
-
-    pub fn last_version_check() -> Result<OffsetDateTime> {
-        Settings::load_time_from_file(LAST_VERSION_CHECK_FILENAME)
-    }
-
-    pub fn host_id() -> Option<HostId> {
-        let id = Settings::read_from_data_dir(HOST_ID_FILENAME);
-
-        if let Some(id) = id {
-            let parsed =
-                Uuid::from_str(id.as_str()).expect("failed to parse host ID from local directory");
-            return Some(HostId(parsed));
-        }
-
-        let uuid = atuin_common::utils::uuid_v7();
-
-        Settings::save_to_data_dir(HOST_ID_FILENAME, uuid.as_simple().to_string().as_ref())
-            .expect("Could not write host ID to data dir");
-
-        Some(HostId(uuid))
-    }
-
-    pub fn should_sync(&self) -> Result<bool> {
-        if !self.auto_sync || !PathBuf::from(self.session_path.as_str()).exists() {
+    pub async fn should_sync(&self) -> Result<bool> {
+        if !self.auto_sync || !Self::meta_store().await?.logged_in().await? {
             return Ok(false);
         }
 
@@ -855,30 +902,26 @@ impl Settings {
         match parse_duration(self.sync_frequency.as_str()) {
             Ok(d) => {
                 let d = time::Duration::try_from(d)?;
-                Ok(OffsetDateTime::now_utc() - Settings::last_sync()? >= d)
+                Ok(OffsetDateTime::now_utc() - Settings::last_sync().await? >= d)
             }
             Err(e) => Err(eyre!("failed to check sync: {}", e)),
         }
     }
 
-    pub fn logged_in(&self) -> bool {
-        let session_path = self.session_path.as_str();
-
-        PathBuf::from(session_path).exists()
+    pub async fn logged_in(&self) -> Result<bool> {
+        Self::meta_store().await?.logged_in().await
     }
 
-    pub fn session_token(&self) -> Result<String> {
-        if !self.logged_in() {
-            return Err(eyre!("Tried to load session; not logged in"));
+    pub async fn session_token(&self) -> Result<String> {
+        match Self::meta_store().await?.session_token().await? {
+            Some(token) => Ok(token),
+            None => Err(eyre!("Tried to load session; not logged in")),
         }
-
-        let session_path = self.session_path.as_str();
-        Ok(fs_err::read_to_string(session_path)?)
     }
 
     #[cfg(feature = "check-update")]
-    fn needs_update_check(&self) -> Result<bool> {
-        let last_check = Settings::last_version_check()?;
+    async fn needs_update_check(&self) -> Result<bool> {
+        let last_check = Settings::last_version_check().await?;
         let diff = OffsetDateTime::now_utc() - last_check;
 
         // Check a max of once per hour
@@ -892,16 +935,9 @@ impl Settings {
         let current =
             Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or(Version::new(100000, 0, 0));
 
-        if !self.needs_update_check()? {
-            // Worst case, we don't want Atuin to fail to start because something funky is going on with
-            // version checking.
-            let version = tokio::task::spawn_blocking(|| {
-                Settings::read_from_data_dir(LATEST_VERSION_FILENAME)
-            })
-            .await
-            .expect("file task panicked");
-
-            let version = match version {
+        if !self.needs_update_check().await? {
+            let meta = Self::meta_store().await?;
+            let version = match meta.latest_version().await? {
                 Some(v) => Version::parse(&v).unwrap_or(current),
                 None => current,
             };
@@ -915,14 +951,9 @@ impl Settings {
         #[cfg(not(feature = "sync"))]
         let latest = current;
 
-        let latest_encoded = latest.to_string();
-        tokio::task::spawn_blocking(move || {
-            Settings::save_version_check_time()?;
-            Settings::save_to_data_dir(LATEST_VERSION_FILENAME, &latest_encoded)?;
-            Ok::<(), eyre::Report>(())
-        })
-        .await
-        .expect("file task panicked")?;
+        let meta = Self::meta_store().await?;
+        Settings::save_version_check_time().await?;
+        meta.save_latest_version(&latest.to_string()).await?;
 
         Ok(latest)
     }
@@ -984,20 +1015,21 @@ impl Settings {
         let kv_path = data_dir.join("kv.db");
         let scripts_path = data_dir.join("scripts.db");
         let socket_path = atuin_common::utils::runtime_dir().join("atuin.sock");
+        let pidfile_path = data_dir.join("atuin-daemon.pid");
 
         let key_path = data_dir.join("key");
-        let session_path = data_dir.join("session");
+        let meta_path = data_dir.join("meta.db");
 
         Ok(Config::builder()
             .set_default("history_format", "{time}\t{command}\t{duration}")?
             .set_default("db_path", db_path.to_str())?
             .set_default("record_store_path", record_store_path.to_str())?
             .set_default("key_path", key_path.to_str())?
-            .set_default("session_path", session_path.to_str())?
             .set_default("dialect", "us")?
             .set_default("timezone", "local")?
             .set_default("auto_sync", true)?
             .set_default("update_check", cfg!(feature = "check-update"))?
+            .set_default("hub_address", "https://hub.atuin.sh")?
             .set_default("sync_address", "https://api.atuin.sh")?
             .set_default("sync_frequency", "5m")?
             .set_default("search_mode", "fuzzy")?
@@ -1047,11 +1079,14 @@ impl Settings {
             .set_default("store_failed", true)?
             .set_default("daemon.sync_frequency", 300)?
             .set_default("daemon.enabled", false)?
+            .set_default("daemon.autostart", false)?
             .set_default("daemon.socket_path", socket_path.to_str())?
+            .set_default("daemon.pidfile_path", pidfile_path.to_str())?
             .set_default("daemon.systemd_socket", false)?
             .set_default("daemon.tcp_port", 8889)?
             .set_default("kv.db_path", kv_path.to_str())?
             .set_default("scripts.db_path", scripts_path.to_str())?
+            .set_default("meta.db_path", meta_path.to_str())?
             .set_default(
                 "search.filters",
                 vec![
@@ -1065,7 +1100,7 @@ impl Settings {
             )?
             .set_default("theme.name", "default")?
             .set_default("theme.debug", None::<bool>)?
-            .set_default("tmux.enabled", true)?
+            .set_default("tmux.enabled", false)?
             .set_default("tmux.width", "80%")?
             .set_default("tmux.height", "60%")?
             .set_default(
@@ -1164,11 +1199,16 @@ impl Settings {
         settings.db_path = Self::expand_path(settings.db_path)?;
         settings.record_store_path = Self::expand_path(settings.record_store_path)?;
         settings.key_path = Self::expand_path(settings.key_path)?;
-        settings.session_path = Self::expand_path(settings.session_path)?;
         settings.daemon.socket_path = Self::expand_path(settings.daemon.socket_path)?;
+        settings.daemon.pidfile_path = Self::expand_path(settings.daemon.pidfile_path)?;
 
         // Validate UI settings
         settings.ui.validate()?;
+
+        // Register meta store config for lazy initialization on first access
+        META_CONFIG
+            .set((settings.meta.db_path.clone(), settings.local_timeout))
+            .ok();
 
         Ok(settings)
     }
@@ -1188,7 +1228,7 @@ impl Settings {
             &self.db_path,
             &self.record_store_path,
             &self.key_path,
-            &self.session_path,
+            &self.meta.db_path,
         ];
         paths.iter().all(|p| !utils::broken_symlink(p))
     }
@@ -1319,14 +1359,16 @@ mod tests {
 
         let db_path: String = config.get("db_path")?;
         let key_path: String = config.get("key_path")?;
-        let session_path: String = config.get("session_path")?;
         let record_store_path: String = config.get("record_store_path")?;
         let kv_db_path: String = config.get("kv.db_path")?;
         let scripts_db_path: String = config.get("scripts.db_path")?;
+        let meta_db_path: String = config.get("meta.db_path")?;
+        let daemon_socket_path: String = config.get("daemon.socket_path")?;
+        let daemon_pidfile_path: String = config.get("daemon.pidfile_path")?;
+        let daemon_autostart: bool = config.get("daemon.autostart")?;
 
         assert_eq!(db_path, custom_dir.join("history.db").to_str().unwrap());
         assert_eq!(key_path, custom_dir.join("key").to_str().unwrap());
-        assert_eq!(session_path, custom_dir.join("session").to_str().unwrap());
         assert_eq!(
             record_store_path,
             custom_dir.join("records.db").to_str().unwrap()
@@ -1336,6 +1378,19 @@ mod tests {
             scripts_db_path,
             custom_dir.join("scripts.db").to_str().unwrap()
         );
+        assert_eq!(meta_db_path, custom_dir.join("meta.db").to_str().unwrap());
+        assert_eq!(
+            daemon_socket_path,
+            atuin_common::utils::runtime_dir()
+                .join("atuin.sock")
+                .to_str()
+                .unwrap()
+        );
+        assert_eq!(
+            daemon_pidfile_path,
+            custom_dir.join("atuin-daemon.pid").to_str().unwrap()
+        );
+        assert!(!daemon_autostart);
 
         Ok(())
     }
@@ -1347,5 +1402,69 @@ mod tests {
 
         assert!(effective.to_str().is_some());
         assert!(effective.ends_with("atuin") || effective == default);
+    }
+
+    #[test]
+    fn keymap_config_deserializes_simple_binding() {
+        let json = r#"{"emacs": {"ctrl-c": "exit"}}"#;
+        let config: super::KeymapConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.emacs.len(), 1);
+        match &config.emacs["ctrl-c"] {
+            super::KeyBindingConfig::Simple(s) => assert_eq!(s, "exit"),
+            _ => panic!("expected Simple variant"),
+        }
+    }
+
+    #[test]
+    fn keymap_config_deserializes_conditional_binding() {
+        let json = r#"{
+            "emacs": {
+                "left": [
+                    {"when": "cursor-at-start", "action": "exit"},
+                    {"action": "cursor-left"}
+                ]
+            }
+        }"#;
+        let config: super::KeymapConfig = serde_json::from_str(json).unwrap();
+        match &config.emacs["left"] {
+            super::KeyBindingConfig::Rules(rules) => {
+                assert_eq!(rules.len(), 2);
+                assert_eq!(rules[0].when.as_deref(), Some("cursor-at-start"));
+                assert_eq!(rules[0].action, "exit");
+                assert!(rules[1].when.is_none());
+                assert_eq!(rules[1].action, "cursor-left");
+            }
+            _ => panic!("expected Rules variant"),
+        }
+    }
+
+    #[test]
+    fn keymap_config_deserializes_vim_normal() {
+        let json = r#"{"vim-normal": {"j": "select-next", "k": "select-previous"}}"#;
+        let config: super::KeymapConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.vim_normal.len(), 2);
+        assert!(config.emacs.is_empty());
+    }
+
+    #[test]
+    fn keymap_config_is_empty_when_default() {
+        let config = super::KeymapConfig::default();
+        assert!(config.is_empty());
+    }
+
+    #[test]
+    fn keymap_config_mixed_modes() {
+        let json = r#"{
+            "emacs": {"ctrl-c": "exit"},
+            "vim-normal": {"q": "exit"},
+            "inspector": {"d": "delete"}
+        }"#;
+        let config: super::KeymapConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.is_empty());
+        assert_eq!(config.emacs.len(), 1);
+        assert_eq!(config.vim_normal.len(), 1);
+        assert_eq!(config.inspector.len(), 1);
+        assert!(config.vim_insert.is_empty());
+        assert!(config.prefix.is_empty());
     }
 }

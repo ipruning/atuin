@@ -6,6 +6,54 @@ All notable changes to this project will be documented in this file.
 
 ### Bug Fixes
 
+- *(deps)* Add use-dev-tty to crossterm in atuin-ai ([#3185](https://github.com/atuinsh/atuin/issues/3185))
+- *(docs)* Update Postgres volume path in Docker as required by pg18 ([#3174](https://github.com/atuinsh/atuin/issues/3174))
+- Systemd Exec for separate server binary ([#3176](https://github.com/atuinsh/atuin/issues/3176))
+- Multiline commands with fish ([#3179](https://github.com/atuinsh/atuin/issues/3179))
+
+
+### Features
+
+- *(docs)* Add Shell Integration and Interoperability docs ([#3163](https://github.com/atuinsh/atuin/issues/3163))
+- `switch-context` ([#3149](https://github.com/atuinsh/atuin/issues/3149))
+- Add Hub authentication for future sync + extra features ([#3010](https://github.com/atuinsh/atuin/issues/3010))
+- Add Atuin AI inline CLI MVP ([#3178](https://github.com/atuinsh/atuin/issues/3178))
+- Add autostart and pid management to daemon ([#3180](https://github.com/atuinsh/atuin/issues/3180))
+
+
+### Miscellaneous Tasks
+
+- Update changelog
+
+
+## [18.12.1] - 2026-02-11
+
+### Bug Fixes
+
+- *(shell)* Fix ATUIN_SESSION errors in tmux popup ([#3170](https://github.com/atuinsh/atuin/issues/3170))
+- *(tui)* Enter in vim normal mode, shift-tab keybind ([#3158](https://github.com/atuinsh/atuin/issues/3158))
+- Server start commands for Docker. ([#3160](https://github.com/atuinsh/atuin/issues/3160))
+
+
+### Features
+
+- Expand keybinding system with vim motions, media keys, and inspector improvements ([#3161](https://github.com/atuinsh/atuin/issues/3161))
+- Add original-input-empty keybind condition ([#3171](https://github.com/atuinsh/atuin/issues/3171))
+
+
+### Miscellaneous Tasks
+
+- Update changelog
+
+
+## [18.12.0] - 2026-02-09
+
+### Bug Fixes
+
+- *(powershell)* Preserve `$LASTEXITCODE` ([#3120](https://github.com/atuinsh/atuin/issues/3120))
+- *(powershell)* Display search stderr ([#3146](https://github.com/atuinsh/atuin/issues/3146))
+- *(search)* Allow hyphen-prefixed query args like `---` ([#3129](https://github.com/atuinsh/atuin/issues/3129))
+- *(tui)* Space and F1-F24 keys not handled properly by new keybind system ([#3138](https://github.com/atuinsh/atuin/issues/3138))
 - *(ui)* Don't draw a leading space for command
 - *(ui)* Time column can take up to 9 cells
 - *(ui)* Align cursor with the expand column (usually the command)
@@ -16,10 +64,18 @@ All notable changes to this project will be documented in this file.
 - Do not set ATUIN_SESSION if it is already set ([#3107](https://github.com/atuinsh/atuin/issues/3107))
 - Custom data dir test on windows ([#3109](https://github.com/atuinsh/atuin/issues/3109))
 - New session on shlvl change ([#3111](https://github.com/atuinsh/atuin/issues/3111))
+- Larger exit column width on Windows ([#3119](https://github.com/atuinsh/atuin/issues/3119))
+- Halt sync loop if server returns an empty page ([#3122](https://github.com/atuinsh/atuin/issues/3122))
+- Use directories crate for home dir resolution ([#3125](https://github.com/atuinsh/atuin/issues/3125))
+- Tab behaving like enter, eprintln ([#3135](https://github.com/atuinsh/atuin/issues/3135))
+- Issue with shift and modifier keys ([#3143](https://github.com/atuinsh/atuin/issues/3143))
+- Remove invalid IF EXISTS from sqlite drop column migration ([#3145](https://github.com/atuinsh/atuin/issues/3145))
 
 
 ### Documentation
 
+- *(CONTRIBUTING)* Update links ([#3117](https://github.com/atuinsh/atuin/issues/3117))
+- *(README)* Update links ([#3116](https://github.com/atuinsh/atuin/issues/3116))
 - *(config)* Clarify scope of directory filter_mode ([#3082](https://github.com/atuinsh/atuin/issues/3082))
 - *(configuration)* Describe new utility "atuin-bind" for Bash ([#3064](https://github.com/atuinsh/atuin/issues/3064))
 - *(installation)* Add mise alternative installation method ([#3066](https://github.com/atuinsh/atuin/issues/3066))
@@ -31,11 +87,17 @@ All notable changes to this project will be documented in this file.
 - Config/ with initial uid:gid
 - Add PowerShell install instructions
 - Add PowerShell and Windows install instructions ([#3096](https://github.com/atuinsh/atuin/issues/3096))
+- Update the `[keys]` docs ([#3114](https://github.com/atuinsh/atuin/issues/3114))
+- Add history deletion guide ([#3130](https://github.com/atuinsh/atuin/issues/3130))
+- Update how to use Docker to self-host ([#3148](https://github.com/atuinsh/atuin/issues/3148))
+- Add IRC contact information to README
 
 
 ### Features
 
+- *(dotfiles)* Add sort and filter options to alias/var list ([#3131](https://github.com/atuinsh/atuin/issues/3131))
 - *(theme)* Note new default theme name and syntax ([#3080](https://github.com/atuinsh/atuin/issues/3080))
+- *(tui)* Add clear-to-start/end actions ([#3141](https://github.com/atuinsh/atuin/issues/3141))
 - *(ui)* Highlight fulltext search as fulltext search instead of fuzzy search
 - *(ui)* Highlight fulltext search as fulltext search instead of fuzzy search ([#3098](https://github.com/atuinsh/atuin/issues/3098))
 - *(ultracompact)* Adds setting for ultracompact mode ([#3079](https://github.com/atuinsh/atuin/issues/3079))
@@ -46,6 +108,9 @@ All notable changes to this project will be documented in this file.
 - Remove user verification functionality ([#3108](https://github.com/atuinsh/atuin/issues/3108))
 - Add option to use tmux display-popup ([#3058](https://github.com/atuinsh/atuin/issues/3058))
 - Move atuin-server to its own binary ([#3112](https://github.com/atuinsh/atuin/issues/3112))
+- Add a parameter to the sync to specify the download/upload page ([#2408](https://github.com/atuinsh/atuin/issues/2408))
+- Replace several files with a sqlite db ([#3128](https://github.com/atuinsh/atuin/issues/3128))
+- Add new custom keybinding system for search TUI ([#3127](https://github.com/atuinsh/atuin/issues/3127))
 
 
 ### Miscellaneous Tasks
@@ -54,6 +119,11 @@ All notable changes to this project will be documented in this file.
   - **BREAKING**: remove total_history from api index response ([#3094](https://github.com/atuinsh/atuin/issues/3094))
 - Update to rust 1.93
 - Update to rust 1.93 ([#3101](https://github.com/atuinsh/atuin/issues/3101))
+- Update changelog
+- Update agents.md ([#3126](https://github.com/atuinsh/atuin/issues/3126))
+- Update changelog
+- Update changelog
+- Update changelog
 
 
 ### Theming

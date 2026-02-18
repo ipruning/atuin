@@ -32,6 +32,7 @@ use super::{
     settings::{FilterMode, SearchMode, Settings},
 };
 
+#[derive(Clone)]
 pub struct Context {
     pub session: String,
     pub cwd: String,
@@ -54,24 +55,33 @@ pub struct OptFilters {
     pub include_duplicates: bool,
 }
 
-pub fn current_context() -> Context {
-    let Ok(session) = env::var("ATUIN_SESSION") else {
-        eprintln!(
-            "ERROR: Failed to find $ATUIN_SESSION in the environment. Check that you have correctly set up your shell."
-        );
-        std::process::exit(1);
-    };
+pub async fn current_context() -> eyre::Result<Context> {
+    let session = env::var("ATUIN_SESSION").map_err(|_| {
+        eyre::eyre!("Failed to find $ATUIN_SESSION in the environment. Check that you have correctly set up your shell.")
+    })?;
     let hostname = get_host_user();
     let cwd = utils::get_current_dir();
-    let host_id = Settings::host_id().expect("failed to load host ID");
+    let host_id = Settings::host_id().await?;
     let git_root = utils::in_git_repo(cwd.as_str());
 
-    Context {
+    Ok(Context {
         session,
         hostname,
         cwd,
         git_root,
         host_id: host_id.0.as_simple().to_string(),
+    })
+}
+
+impl Context {
+    pub fn from_history(entry: &History) -> Self {
+        Context {
+            session: entry.session.to_string(),
+            cwd: entry.cwd.to_string(),
+            hostname: entry.hostname.to_string(),
+            host_id: String::new(),
+            git_root: utils::in_git_repo(entry.cwd.as_str()),
+        }
     }
 }
 

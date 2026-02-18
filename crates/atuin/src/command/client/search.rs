@@ -23,6 +23,7 @@ mod engines;
 mod history_list;
 mod inspector;
 mod interactive;
+pub mod keybindings;
 
 pub use duration::format_duration_into;
 
@@ -85,6 +86,7 @@ pub struct Cmd {
     #[arg(long)]
     human: bool,
 
+    #[arg(allow_hyphen_values = true)]
     query: Option<Vec<String>>,
 
     /// Show only the text of the command
@@ -210,7 +212,7 @@ impl Cmd {
 
         let encryption_key: [u8; 32] = encryption::load_key(settings)?.into();
 
-        let host_id = Settings::host_id().expect("failed to get host_id");
+        let host_id = Settings::host_id().await?;
         let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
 
         if self.interactive {
@@ -304,7 +306,7 @@ async fn run_non_interactive(
         filter_options.cwd
     };
 
-    let context = current_context();
+    let context = current_context().await?;
 
     let opt_filter = OptFilters {
         cwd: dir.clone(),
@@ -324,4 +326,28 @@ async fn run_non_interactive(
         .await?;
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cmd;
+    use clap::Parser;
+
+    #[test]
+    fn search_for_triple_dash() {
+        // Issue #3028: searching for `---` should not be treated as a CLI flag
+        let cmd = Cmd::try_parse_from(["search", "---"]);
+        assert!(cmd.is_ok(), "Failed to parse '---' as a query: {cmd:?}");
+        let cmd = cmd.unwrap();
+        assert_eq!(cmd.query, Some(vec!["---".to_string()]));
+    }
+
+    #[test]
+    fn search_for_double_dash_value() {
+        // Searching for strings starting with -- should also work
+        let cmd = Cmd::try_parse_from(["search", "--", "--foo"]);
+        assert!(cmd.is_ok());
+        let cmd = cmd.unwrap();
+        assert_eq!(cmd.query, Some(vec!["--foo".to_string()]));
+    }
 }

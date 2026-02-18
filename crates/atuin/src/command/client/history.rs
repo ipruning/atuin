@@ -27,6 +27,8 @@ use atuin_client::{record, sync};
 use log::{debug, warn};
 use time::{OffsetDateTime, macros::format_description};
 
+#[cfg(feature = "daemon")]
+use super::daemon;
 use super::search::format_duration_into;
 
 #[derive(Subcommand, Debug)]
@@ -370,7 +372,12 @@ impl Cmd {
         // print the ID
         // we use this as the key for calling end
         println!("{}", h.id);
-        db.save(&h).await?;
+
+        // Silently ignore database errors to avoid breaking the shell
+        // This is important when disk is full or database is locked
+        if let Err(e) = db.save(&h).await {
+            debug!("failed to save history: {e}");
+        }
 
         Ok(())
     }
@@ -392,15 +399,15 @@ impl Cmd {
             return Ok(());
         }
 
-        let resp = atuin_daemon::client::HistoryClient::new(
-            #[cfg(not(unix))]
-            settings.daemon.tcp_port,
-            #[cfg(unix)]
-            settings.daemon.socket_path.clone(),
-        )
-        .await?
-        .start_history(h)
-        .await?;
+        // Attempt to start history via daemon, but silently ignore errors
+        // to avoid breaking the shell when the daemon is unavailable or disk is full
+        let resp = match daemon::start_history(settings, h.clone()).await {
+            Ok(id) => id,
+            Err(e) => {
+                debug!("failed to start history via daemon: {e}");
+                h.id.0.clone()
+            }
+        };
 
         // print the ID
         // we use this as the key for calling end
@@ -454,12 +461,12 @@ impl Cmd {
         db.update(&h).await?;
         history_store.push(h).await?;
 
-        if settings.should_sync()? {
+        if settings.should_sync().await? {
             #[cfg(feature = "sync")]
             {
                 if settings.sync.records {
                     let (_, downloaded) = record::sync::sync(settings, &store).await?;
-                    Settings::save_sync_time()?;
+                    Settings::save_sync_time().await?;
 
                     crate::sync::build(settings, &store, db, Some(&downloaded)).await?;
                 } else {
@@ -477,22 +484,13 @@ impl Cmd {
     }
 
     #[cfg(feature = "daemon")]
-    #[allow(unused_variables)]
     async fn handle_daemon_end(
         settings: &Settings,
         id: &str,
         exit: i64,
         duration: Option<u64>,
     ) -> Result<()> {
-        let resp = atuin_daemon::client::HistoryClient::new(
-            #[cfg(not(unix))]
-            settings.daemon.tcp_port,
-            #[cfg(unix)]
-            settings.daemon.socket_path.clone(),
-        )
-        .await?
-        .end_history(id.to_string(), duration.unwrap_or(0), exit)
-        .await?;
+        daemon::end_history(settings, id.to_string(), duration.unwrap_or(0), exit).await?;
 
         Ok(())
     }
@@ -579,7 +577,7 @@ impl Cmd {
             let encryption_key: [u8; 32] = encryption::load_key(settings)
                 .context("could not load encryption key")?
                 .into();
-            let host_id = Settings::host_id().expect("failed to get host_id");
+            let host_id = Settings::host_id().await?;
             let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
 
             for entry in matches {
@@ -634,7 +632,7 @@ impl Cmd {
             let encryption_key: [u8; 32] = encryption::load_key(settings)
                 .context("could not load encryption key")?
                 .into();
-            let host_id = Settings::host_id().expect("failed to get host_id");
+            let host_id = Settings::host_id().await?;
             let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
 
             for entry in matches {
@@ -651,7 +649,7 @@ impl Cmd {
     }
 
     pub async fn run(self, settings: &Settings) -> Result<()> {
-        let context = current_context();
+        let context = current_context().await?;
 
         #[cfg(feature = "daemon")]
         // Skip initializing any databases for start/end, if the daemon is enabled
@@ -680,7 +678,7 @@ impl Cmd {
             .context("could not load encryption key")?
             .into();
 
-        let host_id = Settings::host_id().expect("failed to get host_id");
+        let host_id = Settings::host_id().await?;
         let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
 
         match self {
