@@ -27,6 +27,27 @@ mod dotfiles;
 mod kv;
 pub(crate) mod meta;
 mod scripts;
+pub mod watcher;
+
+pub struct HubEndpoint(String);
+
+/// Default sync address for Atuin's hosted service
+pub const DEFAULT_SYNC_ADDRESS: &str = "https://api.atuin.sh";
+
+/// Default Hub web/API endpoint for Atuin's hosted service
+pub const DEFAULT_HUB_ENDPOINT: &str = "https://hub.atuin.sh";
+
+impl Default for HubEndpoint {
+    fn default() -> Self {
+        HubEndpoint(DEFAULT_HUB_ENDPOINT.to_string())
+    }
+}
+
+impl AsRef<str> for HubEndpoint {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Copy, ValueEnum, PartialEq, Serialize)]
 pub enum SearchMode {
@@ -42,6 +63,10 @@ pub enum SearchMode {
 
     #[serde(rename = "skim")]
     Skim,
+
+    #[serde(rename = "daemon-fuzzy")]
+    #[clap(aliases = &["daemon-fuzzy"])]
+    DaemonFuzzy,
 }
 
 impl SearchMode {
@@ -51,6 +76,7 @@ impl SearchMode {
             SearchMode::FullText => "FULLTXT",
             SearchMode::Fuzzy => "FUZZY",
             SearchMode::Skim => "SKIM",
+            SearchMode::DaemonFuzzy => "DAEMON",
         }
     }
     pub fn next(&self, settings: &Settings) -> Self {
@@ -58,9 +84,13 @@ impl SearchMode {
             SearchMode::Prefix => SearchMode::FullText,
             // if the user is using skim, we go to skim
             SearchMode::FullText if settings.search_mode == SearchMode::Skim => SearchMode::Skim,
+            // if the user is using daemon-fuzzy, we go to daemon-fuzzy
+            SearchMode::FullText if settings.search_mode == SearchMode::DaemonFuzzy => {
+                SearchMode::DaemonFuzzy
+            }
             // otherwise fuzzy.
             SearchMode::FullText => SearchMode::Fuzzy,
-            SearchMode::Fuzzy | SearchMode::Skim => SearchMode::Prefix,
+            SearchMode::Fuzzy | SearchMode::Skim | SearchMode::DaemonFuzzy => SearchMode::Prefix,
         }
     }
 }
@@ -332,6 +362,27 @@ pub struct Sync {
     pub records: bool,
 }
 
+/// Sync protocol type for authentication.
+///
+/// This setting is primarily for development/testing. When not explicitly set,
+/// the protocol is inferred from the sync_address:
+/// - Default sync address (api.atuin.sh) → Hub protocol
+/// - Custom sync address → Legacy protocol
+///
+/// Set explicitly to "hub" to use Hub authentication with a custom sync_address
+/// (useful for local development against a Hub instance).
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncProtocol {
+    /// Use Hub authentication (Bearer token from Hub OAuth flow)
+    Hub,
+    /// Use legacy CLI authentication (Token from CLI register/login)
+    Legacy,
+    /// Infer from sync_address (default behavior)
+    #[default]
+    Auto,
+}
+
 #[derive(Clone, Debug, Deserialize, Default, Serialize)]
 pub struct Keys {
     pub scroll_exits: bool,
@@ -463,6 +514,18 @@ pub struct Daemon {
 pub struct Search {
     /// The list of enabled filter modes, in order of priority.
     pub filters: Vec<FilterMode>,
+
+    /// The recency score multiplier for the search index (default: 1.0).
+    /// Values < 1.0 reduce weight, > 1.0 increase weight, 0.0 disables.
+    pub recency_score_multiplier: f64,
+
+    /// The frequency score multiplier for the search index (default: 1.0).
+    /// Values < 1.0 reduce weight, > 1.0 increase weight, 0.0 disables.
+    pub frequency_score_multiplier: f64,
+
+    /// The overall frecency score multiplier for the search index (default: 1.0).
+    /// Applied after combining recency and frequency scores.
+    pub frecency_score_multiplier: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -475,6 +538,95 @@ pub struct Tmux {
 
     /// Height of the tmux popup (percentage)
     pub height: String,
+}
+
+/// Log level for file logging. Maps to tracing's LevelFilter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    /// Convert to a tracing directive string for use with EnvFilter.
+    pub fn as_directive(&self) -> &'static str {
+        match self {
+            LogLevel::Trace => "trace",
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+        }
+    }
+}
+
+/// Configuration for a specific log type (search or daemon).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct LogConfig {
+    /// Log file name (relative to dir) or absolute path.
+    pub file: String,
+
+    /// Override global enabled setting for this log type.
+    pub enabled: Option<bool>,
+
+    /// Override global level setting for this log type.
+    pub level: Option<LogLevel>,
+
+    /// Override global retention days setting for this log type.
+    pub retention: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Logs {
+    /// Enable file logging globally. Defaults to true.
+    #[serde(default = "Logs::default_enabled")]
+    pub enabled: bool,
+
+    /// Directory for log files. Defaults to ~/.atuin/logs
+    pub dir: String,
+
+    /// Default log level for file logging. Defaults to "info".
+    /// Note: ATUIN_LOG environment variable overrides this.
+    #[serde(default)]
+    pub level: LogLevel,
+
+    /// Default retention days for log files. Defaults to 4.
+    #[serde(default = "Logs::default_retention")]
+    pub retention: u64,
+
+    /// Search log settings
+    #[serde(default)]
+    pub search: LogConfig,
+
+    /// Daemon log settings
+    #[serde(default)]
+    pub daemon: LogConfig,
+
+    /// AI log settings
+    #[serde(default)]
+    pub ai: LogConfig,
+}
+
+#[derive(Default, Clone, Debug, Deserialize, Serialize)]
+pub struct Ai {
+    /// Whether or not the AI features are enabled.
+    pub enabled: bool,
+
+    /// The address of the Atuin AI endpoint. Used for AI features like command generation.
+    /// Only necessary for custom AI endpoints.
+    pub endpoint: Option<String>,
+
+    /// The API token for the Atuin AI endpoint. Used for AI features like command generation.
+    /// Only necessary for custom AI endpoints.
+    pub api_token: Option<String>,
+
+    /// Whether or not to send the current working directory to the AI endpoint.
+    pub send_cwd: bool,
 }
 
 impl Default for Preview {
@@ -509,6 +661,111 @@ impl Default for Daemon {
     }
 }
 
+impl Default for Logs {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dir: "".to_string(),
+            level: LogLevel::default(),
+            retention: Self::default_retention(),
+            search: LogConfig {
+                file: "search.log".to_string(),
+                ..Default::default()
+            },
+            daemon: LogConfig {
+                file: "daemon.log".to_string(),
+                ..Default::default()
+            },
+            ai: LogConfig {
+                file: "ai.log".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+}
+
+impl Logs {
+    fn default_enabled() -> bool {
+        true
+    }
+
+    fn default_retention() -> u64 {
+        4
+    }
+
+    /// Returns whether search logging is enabled.
+    /// Uses search-specific setting if set, otherwise falls back to global.
+    pub fn search_enabled(&self) -> bool {
+        self.search.enabled.unwrap_or(self.enabled)
+    }
+
+    /// Returns whether daemon logging is enabled.
+    /// Uses daemon-specific setting if set, otherwise falls back to global.
+    pub fn daemon_enabled(&self) -> bool {
+        self.daemon.enabled.unwrap_or(self.enabled)
+    }
+
+    /// Returns whether AI logging is enabled.
+    /// Uses AI-specific setting if set, otherwise falls back to global.
+    pub fn ai_enabled(&self) -> bool {
+        self.ai.enabled.unwrap_or(self.enabled)
+    }
+
+    /// Returns the log level for search logging.
+    /// Uses search-specific setting if set, otherwise falls back to global.
+    pub fn search_level(&self) -> LogLevel {
+        self.search.level.unwrap_or(self.level)
+    }
+
+    /// Returns the log level for daemon logging.
+    /// Uses daemon-specific setting if set, otherwise falls back to global.
+    pub fn daemon_level(&self) -> LogLevel {
+        self.daemon.level.unwrap_or(self.level)
+    }
+
+    /// Returns the log level for AI logging.
+    /// Uses AI-specific setting if set, otherwise falls back to global.
+    pub fn ai_level(&self) -> LogLevel {
+        self.ai.level.unwrap_or(self.level)
+    }
+
+    /// Returns the retention days for search logging.
+    /// Uses search-specific setting if set, otherwise falls back to global.
+    pub fn search_retention(&self) -> u64 {
+        self.search.retention.unwrap_or(self.retention)
+    }
+
+    /// Returns the retention days for daemon logging.
+    /// Uses daemon-specific setting if set, otherwise falls back to global.
+    pub fn daemon_retention(&self) -> u64 {
+        self.daemon.retention.unwrap_or(self.retention)
+    }
+
+    /// Returns the retention days for AI logging.
+    /// Uses AI-specific setting if set, otherwise falls back to global.
+    pub fn ai_retention(&self) -> u64 {
+        self.ai.retention.unwrap_or(self.retention)
+    }
+
+    /// Returns the full path for the search log file.
+    pub fn search_path(&self) -> PathBuf {
+        let path = PathBuf::from(&self.search.file);
+        PathBuf::from(&self.dir).join(path)
+    }
+
+    /// Returns the full path for the daemon log file.
+    pub fn daemon_path(&self) -> PathBuf {
+        let path = PathBuf::from(&self.daemon.file);
+        PathBuf::from(&self.dir).join(path)
+    }
+
+    /// Returns the full path for the AI log file.
+    pub fn ai_path(&self) -> PathBuf {
+        let path = PathBuf::from(&self.ai.file);
+        PathBuf::from(&self.dir).join(path)
+    }
+}
+
 impl Default for Search {
     fn default() -> Self {
         Self {
@@ -520,6 +777,10 @@ impl Default for Search {
                 FilterMode::Workspace,
                 FilterMode::Directory,
             ],
+
+            recency_score_multiplier: 1.0,
+            frequency_score_multiplier: 1.0,
+            frecency_score_multiplier: 1.0,
         }
     }
 }
@@ -743,11 +1004,14 @@ pub struct Settings {
     pub auto_sync: bool,
     pub update_check: bool,
 
-    /// The address of the Atuin Hub. Used for Hub-specific features like AI.
-    pub hub_address: String,
-
     /// The sync address for atuin.
     pub sync_address: String,
+
+    /// Sync protocol for authentication. When set to "auto" (default), the protocol
+    /// is inferred from sync_address. Set to "hub" to force Hub auth with a custom
+    /// sync_address (useful for local development).
+    #[serde(default)]
+    pub sync_protocol: SyncProtocol,
 
     pub sync_frequency: String,
     pub db_path: String,
@@ -835,7 +1099,13 @@ pub struct Settings {
     pub tmux: Tmux,
 
     #[serde(default)]
+    pub logs: Logs,
+
+    #[serde(default)]
     pub meta: meta::Settings,
+
+    #[serde(default)]
+    pub ai: Ai,
 }
 
 impl Settings {
@@ -916,6 +1186,90 @@ impl Settings {
         match Self::meta_store().await?.session_token().await? {
             Some(token) => Ok(token),
             None => Err(eyre!("Tried to load session; not logged in")),
+        }
+    }
+
+    pub async fn hub_session_token(&self) -> Result<String> {
+        match Self::meta_store().await?.hub_session_token().await? {
+            Some(token) => Ok(token),
+            None => Err(eyre!("Tried to load hub session; not logged in")),
+        }
+    }
+
+    /// Normalize a URL for comparison by trimming trailing slashes
+    fn normalize_url(url: &str) -> &str {
+        url.trim_end_matches('/')
+    }
+
+    /// Check if a URL matches one of Atuin's official hosted addresses
+    fn is_official_address(url: &str) -> bool {
+        let normalized = Self::normalize_url(url);
+        normalized == Self::normalize_url(DEFAULT_SYNC_ADDRESS)
+            || normalized == Self::normalize_url(DEFAULT_HUB_ENDPOINT)
+    }
+
+    /// Returns whether this configuration uses Hub-style sync.
+    ///
+    /// Hub sync uses Bearer token authentication and is the default for
+    /// Atuin's hosted service. This returns true when:
+    /// - `sync_protocol` is explicitly set to `Hub`, OR
+    /// - `sync_protocol` is `Auto` and `sync_address` is an official Atuin address
+    pub fn is_hub_sync(&self) -> bool {
+        match self.sync_protocol {
+            SyncProtocol::Hub => true,
+            SyncProtocol::Legacy => false,
+            SyncProtocol::Auto => Self::is_official_address(&self.sync_address),
+        }
+    }
+
+    /// Returns the base URL for the Hub endpoint.
+    ///
+    /// For Atuin's official hosted service, this always returns `https://hub.atuin.sh`
+    /// regardless of whether `sync_address` is `api.atuin.sh` or `hub.atuin.sh`.
+    /// For self-hosted instances, returns the configured `sync_address`.
+    pub fn active_hub_endpoint(&self) -> Option<HubEndpoint> {
+        if self.is_hub_sync() {
+            if Self::is_official_address(&self.sync_address) {
+                Some(HubEndpoint::default())
+            } else {
+                Some(HubEndpoint(self.sync_address.clone()))
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Returns the best available auth token for sync operations.
+    ///
+    /// Token priority when using Hub sync:
+    /// 1. Hub token (Bearer) - enables unified Hub auth
+    /// 2. CLI session token (Token) - fallback if Hub token revoked
+    ///
+    /// For legacy/self-hosted sync, only CLI session token is used.
+    ///
+    /// Hub tokens are preferred when available because they provide unified
+    /// authentication across CLI and Hub features, and users can manage them
+    /// via the Hub web interface.
+    #[cfg(feature = "sync")]
+    pub async fn sync_auth_token(&self) -> Result<crate::api_client::AuthToken> {
+        use crate::api_client::AuthToken;
+
+        let meta = Self::meta_store().await?;
+
+        // Try Hub token first if we're using Hub sync
+        if self.is_hub_sync()
+            && let Some(hub_token) = meta.hub_session_token().await?
+        {
+            return Ok(AuthToken::Bearer(hub_token));
+        }
+
+        // Fall back to CLI session token
+        match meta.session_token().await? {
+            Some(token) => Ok(AuthToken::Token(token)),
+            None => Err(eyre!(
+                "Not logged in - no Hub session or CLI session found. \
+                 Run 'atuin login' or 'atuin register' to authenticate."
+            )),
         }
     }
 
@@ -1016,6 +1370,7 @@ impl Settings {
         let scripts_path = data_dir.join("scripts.db");
         let socket_path = atuin_common::utils::runtime_dir().join("atuin.sock");
         let pidfile_path = data_dir.join("atuin-daemon.pid");
+        let logs_dir = atuin_common::utils::logs_dir();
 
         let key_path = data_dir.join("key");
         let meta_path = data_dir.join("meta.db");
@@ -1029,7 +1384,6 @@ impl Settings {
             .set_default("timezone", "local")?
             .set_default("auto_sync", true)?
             .set_default("update_check", cfg!(feature = "check-update"))?
-            .set_default("hub_address", "https://hub.atuin.sh")?
             .set_default("sync_address", "https://api.atuin.sh")?
             .set_default("sync_frequency", "5m")?
             .set_default("search_mode", "fuzzy")?
@@ -1084,9 +1438,20 @@ impl Settings {
             .set_default("daemon.pidfile_path", pidfile_path.to_str())?
             .set_default("daemon.systemd_socket", false)?
             .set_default("daemon.tcp_port", 8889)?
+            .set_default("logs.enabled", true)?
+            .set_default("logs.dir", logs_dir.to_str())?
+            .set_default("logs.level", "info")?
+            .set_default("logs.search.file", "search.log")?
+            .set_default("logs.daemon.file", "daemon.log")?
+            .set_default("logs.ai.file", "ai.log")?
             .set_default("kv.db_path", kv_path.to_str())?
             .set_default("scripts.db_path", scripts_path.to_str())?
+            .set_default("search.recency_score_multiplier", 1.0)?
+            .set_default("search.frequency_score_multiplier", 1.0)?
+            .set_default("search.frecency_score_multiplier", 1.0)?
             .set_default("meta.db_path", meta_path.to_str())?
+            .set_default("ai.enabled", false)?
+            .set_default("ai.send_cwd", false)?
             .set_default(
                 "search.filters",
                 vec![
@@ -1117,7 +1482,7 @@ impl Settings {
             ))
     }
 
-    pub fn new() -> Result<Self> {
+    pub fn get_config_path() -> Result<PathBuf> {
         let config_dir = atuin_common::utils::config_dir();
 
         create_dir_all(&config_dir)
@@ -1132,6 +1497,12 @@ impl Settings {
         };
 
         config_file.push("config.toml");
+
+        Ok(config_file)
+    }
+
+    pub fn new() -> Result<Self> {
+        let config_file = Self::get_config_path()?;
 
         // extract data_dir first so we can use it as the base for other path defaults
         let effective_data_dir = if config_file.exists() {
@@ -1201,6 +1572,9 @@ impl Settings {
         settings.key_path = Self::expand_path(settings.key_path)?;
         settings.daemon.socket_path = Self::expand_path(settings.daemon.socket_path)?;
         settings.daemon.pidfile_path = Self::expand_path(settings.daemon.pidfile_path)?;
+        settings.logs.dir = Self::expand_path(settings.logs.dir)?;
+        settings.logs.search.file = Self::expand_path(settings.logs.search.file)?;
+        settings.logs.daemon.file = Self::expand_path(settings.logs.daemon.file)?;
 
         // Validate UI settings
         settings.ui.validate()?;
@@ -1245,6 +1619,20 @@ impl Default for Settings {
             .try_deserialize()
             .expect("Could not deserialize config")
     }
+}
+
+/// Initialize the meta store configuration for testing.
+///
+/// This should only be used in tests. It allows tests to bypass the normal
+/// Settings::new() flow while still being able to use Settings::host_id()
+/// and other meta store dependent functions.
+///
+/// # Safety
+/// This function is not thread-safe with concurrent calls to Settings::new()
+/// or other meta store initialization. Only call from tests.
+#[doc(hidden)]
+pub fn init_meta_config_for_testing(meta_db_path: impl Into<String>, local_timeout: f64) {
+    META_CONFIG.set((meta_db_path.into(), local_timeout)).ok();
 }
 
 #[cfg(test)]

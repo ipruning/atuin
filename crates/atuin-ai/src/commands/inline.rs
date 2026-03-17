@@ -1,86 +1,113 @@
+use crate::commands::detect_shell;
+use crate::tui::render::render;
+use crate::tui::{
+    App, AppEvent, AppMode, ConversationEvent, EventLoop, ExitAction, RenderContext, TerminalGuard,
+    calculate_needed_height, install_panic_hook,
+};
+use atuin_client::theme::ThemeManager;
 use atuin_common::tls::ensure_crypto_provider;
 use crossterm::{
-    cursor,
     event::{self, Event, KeyCode},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
+use eventsource_stream::Eventsource;
 use eyre::{Context as _, Result, bail};
-use ratatui::{
-    Frame, Terminal, TerminalOptions, Viewport,
-    backend::CrosstermBackend,
-    layout::{Alignment, Rect},
-    text::Line,
-    widgets::{Block, Borders, Paragraph, Wrap},
-};
+use futures::StreamExt;
 use reqwest::Url;
-use serde::{Deserialize, Serialize};
-use std::time::Duration;
-
-#[derive(Debug, Serialize)]
-struct GenerateRequest {
-    query: String,
-    description: String,
-    context: GenerateContext,
-}
-
-#[derive(Debug, Serialize)]
-struct GenerateContext {
-    os: String,
-    shell: String,
-    pwd: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GenerateResponse {
-    command: String,
-    #[serde(default)]
-    explanation: Option<String>,
-}
+use std::io::Write;
+use tracing::{debug, error, info, trace};
 
 pub async fn run(
     initial_command: Option<String>,
-    natural_language: bool,
     api_endpoint: Option<String>,
+    api_token: Option<String>,
+    keep_output: bool,
+    debug_state_file: Option<String>,
+    settings: &atuin_client::settings::Settings,
+    output_for_hook: bool,
 ) -> Result<()> {
-    let settings = atuin_client::settings::Settings::new()?;
-    let endpoint = api_endpoint
-        .as_deref()
-        .unwrap_or(settings.hub_address.as_str());
-    let token = ensure_hub_session(&settings, endpoint).await?;
+    if !settings.ai.enabled {
+        emit_shell_result(
+            Action::Print(
+                "Atuin AI is not enabled. Please enable it in your settings or run `atuin setup`."
+                    .to_string(),
+            ),
+            output_for_hook,
+        );
+        return Ok(());
+    }
+
+    // Install panic hook once at entry point to ensure terminal restoration
+    install_panic_hook();
+
+    // Token and endpoint priority:
+    // 1. Command line arguments/environment variables
+    // 2. Settings file
+    // 3. Default
+    let endpoint = api_endpoint.as_deref().unwrap_or(
+        settings
+            .ai
+            .endpoint
+            .as_deref()
+            .unwrap_or("https://hub.atuin.sh"),
+    );
+    let api_token = api_token.as_deref().or(settings.ai.api_token.as_deref());
+
+    let token = if let Some(token) = &api_token {
+        token.to_string()
+    } else {
+        // If no token is provided, assume we're using Hub as the endpoint if we're using Hub sync
+        if settings.is_hub_sync() {
+            ensure_hub_session(settings).await?
+        } else {
+            bail!("No API token provided in ai.api_token settings or command line argument.")
+        }
+    };
+
     let action = run_inline_tui(
         endpoint.to_string(),
         token,
-        if natural_language {
-            None
-        } else {
-            initial_command
-        },
+        initial_command,
+        keep_output,
+        debug_state_file,
+        settings,
     )
     .await?;
-    emit_shell_result(action.0, &action.1);
+    emit_shell_result(action, output_for_hook);
 
     Ok(())
 }
 
-async fn ensure_hub_session(
-    settings: &atuin_client::settings::Settings,
-    hub_address: &str,
-) -> Result<String> {
+async fn ensure_hub_session(settings: &atuin_client::settings::Settings) -> Result<String> {
     if let Some(token) = atuin_client::hub::get_session_token().await? {
+        debug!("Found Hub session, using existing token");
         return Ok(token);
     }
 
+    let hub_address = settings.active_hub_endpoint().unwrap_or_default();
+
+    let will_sync = settings.is_hub_sync();
+
+    info!("No Hub session found, prompting for authentication");
+
     println!("Atuin AI requires authenticating with Atuin Hub.");
-    println!("This is separate from your sync setup.");
+    if will_sync {
+        println!(
+            "Once logged in, your shell history will be synchronized via Atuin Hub if auto_sync is enabled or when manually syncing."
+        )
+    }
+    println!(
+        "If you have an existing Atuin sync account, you can log in with your existing credentials."
+    );
     println!("Press enter to begin (or esc to cancel).");
     if !wait_for_login_confirmation()? {
         bail!("authentication canceled");
     }
 
+    debug!("Starting Atuin Hub authentication...");
+
     println!("Authenticating with Atuin Hub...");
-    let mut auth_settings = settings.clone();
-    auth_settings.hub_address = hub_address.to_string();
-    let session = atuin_client::hub::HubAuthSession::start(&auth_settings).await?;
+    let session = atuin_client::hub::HubAuthSession::start(hub_address.as_ref()).await?;
     println!("Open this URL to continue:");
     println!("{}", session.auth_url);
 
@@ -91,59 +118,200 @@ async fn ensure_hub_session(
         )
         .await?;
 
+    info!("Authentication complete, saving session token");
+
     atuin_client::hub::save_session(&token).await?;
+
+    // Silently attempt to link CLI account to Hub if one exists
+    // This enables unified auth - users can use their Hub token for sync
+    if let Ok(meta) = atuin_client::settings::Settings::meta_store().await
+        && let Ok(Some(cli_token)) = meta.session_token().await
+    {
+        debug!("CLI session found, attempting to link accounts");
+        if let Err(e) = atuin_client::hub::link_account(hub_address.as_ref(), &cli_token).await {
+            // Don't fail AI flow if linking fails - it's not critical
+            debug!("Could not link CLI account to Hub: {}", e);
+        } else {
+            info!("Successfully linked CLI account to Hub");
+        }
+    }
+
     Ok(token)
 }
 
-async fn generate_command(
-    hub_address: &str,
-    token: &str,
-    description: &str,
-) -> Result<GenerateResponse> {
-    ensure_crypto_provider();
-    let endpoint = hub_url(hub_address, "/api/cli/generate")?;
-    let request = GenerateRequest {
-        query: description.to_string(),
-        description: description.to_string(),
-        context: GenerateContext {
-            os: detect_os(),
-            shell: detect_shell(),
-            pwd: std::env::current_dir()
-                .ok()
-                .map(|path| path.to_string_lossy().into_owned()),
-        },
-    };
+/// SSE event received from chat endpoint
+#[derive(Debug, Clone)]
+enum ChatStreamEvent {
+    /// Text chunk to display
+    TextChunk(String),
+    /// Tool call event (need to echo back, may contain suggest_command)
+    ToolCall {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// Tool result from server-side execution
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    },
+    /// Status update from server
+    Status(String),
+    /// Stream complete
+    Done { session_id: String },
+    /// Error from server
+    Error(String),
+}
 
-    let client = reqwest::Client::new();
-    let response = client
-        .post(endpoint)
-        .bearer_auth(token)
-        .json(&request)
-        .send()
-        .await
-        .context("failed to call Atuin Hub generate endpoint")?;
+fn create_chat_stream(
+    hub_address: String,
+    token: String,
+    session_id: Option<String>,
+    messages: Vec<serde_json::Value>,
+    settings: &atuin_client::settings::Settings,
+) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatStreamEvent>> + Send>> {
+    let send_cwd = settings.ai.send_cwd;
 
-    if response.status().is_success() {
-        let generated = response
-            .json::<GenerateResponse>()
-            .await
-            .context("failed to decode generate response")?;
+    Box::pin(async_stream::stream! {
+        ensure_crypto_provider();
+        let endpoint = match hub_url(&hub_address, "/api/cli/chat") {
+            Ok(url) => url,
+            Err(e) => {
+                yield Err(e);
+                return;
+            }
+        };
 
-        if generated.command.trim().is_empty() {
-            bail!("Hub returned an empty command. Please try again with a more specific request.");
+        debug!("Sending SSE request to {endpoint}");
+
+        // Build request body
+        let mut request_body = serde_json::json!({
+            "messages": messages,
+            "context": {
+                "os": detect_os(),
+                "shell": detect_shell(),
+                "pwd": if send_cwd { std::env::current_dir()
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned()) } else { None },
+            }
+        });
+
+        // Include session_id only if present (not on first request)
+        if let Some(ref sid) = session_id {
+            trace!("Including session_id in request: {sid}");
+            request_body["session_id"] = serde_json::json!(sid);
         }
 
-        return Ok(generated);
-    }
 
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        atuin_client::hub::delete_session().await?;
-        bail!("Hub session expired. Re-run to authenticate again.");
-    }
+        let client = reqwest::Client::new();
+        let response = match client
+            .post(endpoint.clone())
+            .header("Accept", "text/event-stream")
+            .bearer_auth(&token)
+            .json(&request_body)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                yield Err(eyre::eyre!("Failed to send SSE request: {}", e));
+                return;
+            }
+        };
 
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    bail!("Hub request failed ({status}): {body}");
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            // Clear saved session on auth error
+            error!("SSE request failed with status: {status}, clearing session");
+            let _ = atuin_client::hub::delete_session().await;
+            yield Err(eyre::eyre!("Hub session expired. Re-run to authenticate again."));
+            return;
+        }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            error!("SSE request failed ({}): {}", status, body);
+            yield Err(eyre::eyre!("SSE request failed ({}): {}", status, body));
+            return;
+        }
+
+        let byte_stream = response.bytes_stream();
+        let mut stream = byte_stream.eventsource();
+
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(sse_event) => {
+                    let event_type = sse_event.event.as_str();
+                    let data = sse_event.data.clone();
+
+                    debug!(event_type = %event_type, "SSE event received");
+
+                    match event_type {
+                        "text" => {
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data)
+                                && let Some(content) = json.get("content").and_then(|v| v.as_str())
+                            {
+                                yield Ok(ChatStreamEvent::TextChunk(content.to_string()));
+                            }
+                        }
+                        "tool_call" => {
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
+                                let id = json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let name = json.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let input = json.get("input").cloned().unwrap_or(serde_json::json!({}));
+                                yield Ok(ChatStreamEvent::ToolCall { id, name, input });
+                            }
+                        }
+                        "tool_result" => {
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
+                                let tool_use_id = json.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let content = json.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let is_error = json.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                                yield Ok(ChatStreamEvent::ToolResult { tool_use_id, content, is_error });
+                            }
+                        }
+                        "status" => {
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data)
+                                && let Some(state) = json.get("state").and_then(|v| v.as_str())
+                            {
+                                yield Ok(ChatStreamEvent::Status(state.to_string()));
+                            }
+                        }
+                        "done" => {
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
+                                let session_id = json.get("session_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                yield Ok(ChatStreamEvent::Done { session_id });
+                            } else {
+                                yield Ok(ChatStreamEvent::Done { session_id: String::new() });
+                            }
+                            break;
+                        }
+                        "error" => {
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
+                                let message = json.get("message").and_then(|v| v.as_str()).unwrap_or("Unknown error").to_string();
+                                error!("SSE error: {}", message);
+                                yield Ok(ChatStreamEvent::Error(message));
+                            } else {
+                                error!("SSE error: {}", data);
+                                yield Ok(ChatStreamEvent::Error(data));
+                            }
+                            break;
+                        }
+                        _ => {
+                            // Unknown event type, ignore
+                        }
+                    }
+                }
+                Err(e) => {
+                    yield Err(eyre::eyre!("SSE error: {}", e));
+                    break;
+                }
+            }
+        }
+    })
 }
 
 fn hub_url(base: &str, path: &str) -> Result<Url> {
@@ -162,141 +330,378 @@ fn detect_os() -> String {
     match std::env::consts::OS {
         "macos" => "macos".to_string(),
         "linux" => "linux".to_string(),
+        "windows" => "windows".to_string(),
         _ => "linux".to_string(),
     }
 }
 
-fn detect_shell() -> String {
-    if let Ok(shell) = std::env::var("ATUIN_SHELL")
-        && !shell.trim().is_empty()
-    {
-        return shell;
-    }
-
-    let shell = std::env::var("SHELL")
-        .ok()
-        .and_then(|value| {
-            std::path::Path::new(&value)
-                .file_name()
-                .map(std::ffi::OsStr::to_string_lossy)
-                .map(std::borrow::Cow::into_owned)
-        })
-        .filter(|value| !value.trim().is_empty());
-
-    match shell.as_deref() {
-        Some("zsh") => "zsh".to_string(),
-        Some("fish") => "fish".to_string(),
-        Some("bash") => "bash".to_string(),
-        _ => "bash".to_string(),
-    }
+#[derive(Clone)]
+enum Action {
+    Execute(String),
+    Insert(String),
+    Print(String),
+    Cancel,
 }
 
-#[derive(Clone, Copy)]
-enum Action {
-    Execute,
-    Insert,
-    Cancel,
+/// Serialize AppState to JSON for debug logging
+fn state_to_json(state: &crate::tui::AppState) -> serde_json::Value {
+    let events: Vec<serde_json::Value> = state.events.iter().map(|e| e.to_json()).collect();
+
+    let mode = match state.mode {
+        AppMode::Input => "Input",
+        AppMode::Generating => "Generating",
+        AppMode::Streaming => "Streaming",
+        AppMode::Review => "Review",
+        AppMode::Error => "Error",
+    };
+
+    // Get input and cursor from textarea
+    let input = state.input();
+    let cursor = state.textarea.cursor();
+
+    let mut json = serde_json::json!({
+        "events": events,
+        "mode": mode,
+        "input": input,
+        "cursor_row": cursor.0,
+        "cursor_col": cursor.1,
+        "spinner_frame": state.spinner_frame,
+        "confirmation_pending": state.confirmation_pending,
+    });
+
+    // Add streaming fields if in streaming mode
+    if !state.streaming_text.is_empty() {
+        json["streaming_text"] = serde_json::json!(state.streaming_text);
+    }
+    if let Some(ref status) = state.streaming_status {
+        json["streaming_status"] = serde_json::json!(status.display_text());
+    }
+    if let Some(ref err) = state.error {
+        json["error"] = serde_json::json!(err);
+    }
+
+    json
+}
+
+/// Debug logger that writes state changes to a file
+struct DebugStateLogger {
+    file: std::fs::File,
+    entry_count: usize,
+    width: u16,
+}
+
+impl DebugStateLogger {
+    fn new(path: &str) -> Result<Self> {
+        let file = std::fs::File::create(path)
+            .with_context(|| format!("Failed to create debug state file: {}", path))?;
+        // Get terminal width, default to 80
+        let (width, _) = crossterm::terminal::size().unwrap_or((80, 24));
+        Ok(Self {
+            file,
+            entry_count: 0,
+            width,
+        })
+    }
+
+    fn log(&mut self, label: &str, state: &crate::tui::AppState) {
+        use crate::tui::calculate_needed_height;
+
+        self.entry_count += 1;
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+
+        // Calculate the actual content height needed for this state
+        let content_height = calculate_needed_height(state, 0);
+
+        let mut state_json = state_to_json(state);
+        // Add dimensions for accurate replay
+        state_json["width"] = serde_json::json!(self.width);
+        state_json["height"] = serde_json::json!(content_height);
+
+        let entry = serde_json::json!({
+            "entry": self.entry_count,
+            "label": label,
+            "timestamp_ms": timestamp_ms,
+            "state": state_json,
+        });
+
+        // Write as JSONL (one JSON object per line)
+        if let Err(e) = writeln!(self.file, "{}", entry) {
+            tracing::warn!("Failed to write debug state: {}", e);
+        }
+        let _ = self.file.flush();
+    }
 }
 
 async fn run_inline_tui(
     endpoint: String,
     token: String,
     initial_prompt: Option<String>,
-) -> Result<(Action, String)> {
-    let mut ui = InlineUi::new()?;
-    let mut prompt = initial_prompt.unwrap_or_default();
-    let mut spinner_idx = 0usize;
+    keep_output: bool,
+    debug_state_file: Option<String>,
+    settings: &atuin_client::settings::Settings,
+) -> Result<Action> {
+    // Detect popup mode (only on Unix where atuin-hex socket is available)
+    #[cfg(unix)]
+    let mut popup_state = crate::tui::popup::try_setup_popup();
+    #[cfg(not(unix))]
+    let mut popup_state: Option<()> = None;
+
+    let popup_mode = popup_state.is_some();
+
+    // Initialize terminal guard: popup mode uses Fixed viewport, inline uses Inline
+    #[cfg(unix)]
+    let mut guard = if let Some(ref ps) = popup_state {
+        TerminalGuard::new_popup(ps.current_rect, ps.saved_screen.cursor_col)?
+    } else {
+        TerminalGuard::new(keep_output)?
+    };
+    #[cfg(not(unix))]
+    let mut guard = TerminalGuard::new(keep_output)?;
+    let mut app = App::new();
+    if let Some(prompt) = initial_prompt {
+        // Set initial text in textarea
+        let mut textarea = tui_textarea::TextArea::from(prompt.lines());
+        // Disable underline on cursor line
+        textarea.set_cursor_line_style(ratatui::style::Style::default());
+        // Enable word wrapping
+        textarea.set_wrap_mode(tui_textarea::WrapMode::Word);
+        // Move cursor to end
+        textarea.move_cursor(tui_textarea::CursorMove::End);
+        app.state.textarea = textarea;
+    }
+
+    // Initialize debug state logger if requested
+    let mut debug_logger = debug_state_file
+        .map(|path| DebugStateLogger::new(&path))
+        .transpose()?;
+
+    // Helper macro to log state changes
+    macro_rules! log_state {
+        ($label:expr) => {
+            if let Some(ref mut logger) = debug_logger {
+                logger.log($label, &app.state);
+            }
+        };
+    }
+
+    // Log initial state
+    log_state!("init");
+
+    // Load theme
+    let mut theme_manager = ThemeManager::new(None, None);
+    let theme = theme_manager.load_theme(&settings.theme.name, None);
+
+    // Initialize event loop
+    let mut event_loop = EventLoop::new();
+
+    // Track chat stream
+    let mut chat_stream: Option<
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatStreamEvent>> + Send>>,
+    > = None;
 
     loop {
-        ui.render_prompt(&prompt)?;
-        if !event::poll(Duration::from_millis(250)).context("failed to poll for input")? {
-            continue;
+        // Ensure viewport is large enough for current content (capped at terminal height)
+        // In popup mode, use the actual popup width for accurate height calculation
+        let card_width = if popup_mode {
+            #[cfg(unix)]
+            {
+                popup_state
+                    .as_ref()
+                    .map(|ps| {
+                        ps.current_rect
+                            .width
+                            .saturating_sub(crate::tui::popup::POPUP_MARGIN * 2)
+                    })
+                    .unwrap_or(0)
+            }
+            #[cfg(not(unix))]
+            {
+                0
+            }
+        } else {
+            0
+        };
+        let needed_height = calculate_needed_height(&app.state, card_width);
+
+        // Grow popup dynamically as content arrives
+        #[cfg(unix)]
+        if let Some(ref mut ps) = popup_state {
+            // Add vertical margin for visual separation from terminal content
+            let popup_height = needed_height.saturating_add(crate::tui::popup::POPUP_MARGIN * 2);
+            if let Some(new_rect) = ps.fit_to(popup_height) {
+                guard.resize_popup(new_rect)?;
+            }
         }
 
-        let ev = event::read().context("failed to read terminal event")?;
-        let Event::Key(key) = ev else {
-            continue;
+        let actual_height = guard.ensure_height(needed_height)?;
+
+        // Render current state
+        let anchor_col = guard.anchor_col();
+        #[cfg(unix)]
+        let render_above = popup_state.as_ref().is_some_and(|ps| ps.render_above);
+        #[cfg(not(unix))]
+        let render_above = false;
+
+        let ctx = RenderContext {
+            theme,
+            anchor_col,
+            textarea: Some(&app.state.textarea),
+            max_height: actual_height,
+            popup_mode,
+            render_above,
         };
-
-        match key.code {
-            KeyCode::Esc => return Ok((Action::Cancel, String::new())),
-            KeyCode::Backspace => {
-                prompt.pop();
+        // Handle draw errors gracefully - cursor position reads can fail during resize
+        if let Err(e) = guard.terminal().draw(|frame| {
+            render(frame, &app.state, &ctx);
+        }) {
+            let err_msg = e.to_string();
+            if err_msg.contains("cursor position") {
+                // Cursor position read failed (common during terminal resize)
+                // Skip this frame and continue - next frame will likely succeed
+                tracing::debug!(
+                    "Skipping frame due to cursor position read error: {}",
+                    err_msg
+                );
+                continue;
             }
-            KeyCode::Enter => {
-                let query = prompt.trim().to_string();
-                if query.is_empty() {
-                    return Ok((Action::Cancel, String::new()));
-                }
+            return Err(e.into());
+        }
 
-                let response = loop {
-                    let endpoint_clone = endpoint.clone();
-                    let token_clone = token.clone();
-                    let query_clone = query.clone();
-                    let task = tokio::spawn(async move {
-                        generate_command(&endpoint_clone, &token_clone, &query_clone).await
-                    });
+        // Get next event
+        let event = event_loop.run().await?;
 
-                    let generated = loop {
-                        if task.is_finished() {
-                            break task.await.context("generate task join failed")?;
-                        }
-
-                        ui.render_generating(&prompt, spinner_idx)?;
-                        spinner_idx = (spinner_idx + 1) % SPINNER_FRAMES.len();
-
-                        if event::poll(Duration::from_millis(100))
-                            .context("failed to poll while generating")?
-                        {
-                            let ev = event::read().context("failed reading generate event")?;
-                            if let Event::Key(key) = ev
-                                && key.code == KeyCode::Esc
-                            {
-                                task.abort();
-                                return Ok((Action::Cancel, String::new()));
-                            }
-                        }
-                    };
-
-                    match generated {
-                        Ok(value) => break value,
-                        Err(err) => {
-                            ui.render_error(&prompt, &err.to_string())?;
-                            if !wait_for_retry_or_cancel()? {
-                                return Ok((Action::Cancel, String::new()));
-                            }
-                        }
-                    }
-                };
-
-                loop {
-                    ui.render_review(&prompt, &response)?;
-                    if !event::poll(Duration::from_millis(250))
-                        .context("failed to poll in review")?
-                    {
-                        continue;
-                    }
-
-                    let ev = event::read().context("failed to read review event")?;
-                    let Event::Key(key) = ev else {
-                        continue;
-                    };
-
-                    match key.code {
-                        KeyCode::Enter => return Ok((Action::Execute, response.command)),
-                        KeyCode::Tab => return Ok((Action::Insert, response.command)),
-                        KeyCode::Esc => return Ok((Action::Cancel, String::new())),
-                        KeyCode::Char('e') => break,
-                        _ => {}
-                    }
-                }
+        // Handle event based on app mode
+        match event {
+            AppEvent::Key(key) => {
+                app.handle_key(key);
+                log_state!("key");
             }
-            KeyCode::Char(c) => {
-                prompt.push(c);
+            AppEvent::Tick => {
+                app.state.tick();
+
+                // Poll chat stream if active - keep polling until done regardless of mode
+                // (mode may change to Review before we receive the done event with session_id)
+                if let Some(stream) = &mut chat_stream {
+                    let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+                    match stream.as_mut().poll_next(&mut cx) {
+                        std::task::Poll::Ready(Some(Ok(event))) => match event {
+                            ChatStreamEvent::TextChunk(text) => {
+                                trace!(text = %text, "Processing TextChunk");
+                                app.state.append_streaming_text(&text);
+                                log_state!("text_chunk");
+                            }
+                            ChatStreamEvent::ToolCall { id, name, input } => {
+                                trace!(id = %id, name = %name, "Processing ToolCall");
+                                app.state.add_tool_call(id, name, input);
+                                log_state!("tool_call");
+                            }
+                            ChatStreamEvent::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                            } => {
+                                trace!(tool_use_id = %tool_use_id, "Processing ToolResult");
+                                app.state.add_tool_result(tool_use_id, content, is_error);
+                                log_state!("tool_result");
+                            }
+                            ChatStreamEvent::Status(status) => {
+                                trace!(status = %status, "Processing Status");
+                                app.state.update_streaming_status(&status);
+                                log_state!("status");
+                            }
+                            ChatStreamEvent::Done { session_id } => {
+                                trace!(session_id = %session_id, "Processing Done");
+                                chat_stream = None;
+                                if !session_id.is_empty() {
+                                    app.state.store_session_id(session_id);
+                                }
+                                app.state.finalize_streaming();
+                                log_state!("done");
+                            }
+                            ChatStreamEvent::Error(msg) => {
+                                trace!(error = %msg, "Processing Error");
+                                chat_stream = None;
+                                app.state.streaming_error(msg);
+                                log_state!("error");
+                            }
+                        },
+                        std::task::Poll::Ready(Some(Err(e))) => {
+                            chat_stream = None;
+                            app.state.streaming_error(e.to_string());
+                            log_state!("stream_error");
+                        }
+                        std::task::Poll::Ready(None) => {
+                            chat_stream = None;
+                            app.state.finalize_streaming();
+                            log_state!("stream_end");
+                        }
+                        std::task::Poll::Pending => {}
+                    }
+                }
             }
             _ => {}
         }
+
+        // Handle user cancellation (Esc during streaming) - drop the stream
+        if app.state.was_interrupted && chat_stream.is_some() {
+            debug!("User cancelled streaming, dropping chat stream");
+            chat_stream = None;
+            app.state.was_interrupted = false; // Reset the flag
+        }
+
+        // Check exit condition (includes Ctrl+C / SIGINT from event loop)
+        if app.state.should_exit || event_loop.is_shutdown() {
+            break;
+        }
+
+        // Handle generation trigger - unified path for all turns
+        if app.state.mode == AppMode::Generating && chat_stream.is_none() {
+            // Get the last user message from events
+            let last_user_content = app.state.events.iter().rev().find_map(|e| {
+                if let ConversationEvent::UserMessage { content } = e {
+                    Some(content.clone())
+                } else {
+                    None
+                }
+            });
+
+            if last_user_content.is_some() {
+                // Build messages in Claude API format
+                let messages = app.state.events_to_messages();
+
+                // Transition to streaming mode
+                app.state.start_streaming();
+                log_state!("start_streaming");
+
+                // Start the chat stream
+                chat_stream = Some(create_chat_stream(
+                    endpoint.clone(),
+                    token.clone(),
+                    app.state.session_id.clone(),
+                    messages,
+                    settings,
+                ));
+            }
+        }
     }
+
+    // Restore popup area before guard drops (guard skips cleanup in popup mode)
+    #[cfg(unix)]
+    if let Some(ref ps) = popup_state {
+        crate::tui::popup::restore(ps);
+    }
+
+    // Map exit action to return value
+    let result = match app.state.exit_action {
+        Some(ExitAction::Execute(cmd)) => Action::Execute(cmd),
+        Some(ExitAction::Insert(cmd)) => Action::Insert(cmd),
+        _ => Action::Cancel,
+    };
+
+    Ok(result)
 }
 
 struct RawModeGuard;
@@ -307,11 +712,21 @@ impl Drop for RawModeGuard {
     }
 }
 
-fn emit_shell_result(action: Action, command: &str) {
-    match action {
-        Action::Execute => eprintln!("__atuin_ai_execute__:{command}"),
-        Action::Insert => eprintln!("__atuin_ai_insert__:{command}"),
-        Action::Cancel => eprintln!("__atuin_ai_cancel__"),
+fn emit_shell_result(action: Action, output_for_hook: bool) {
+    if output_for_hook {
+        match action {
+            Action::Execute(output) => eprintln!("__atuin_ai_execute__:{output}"),
+            Action::Insert(output) => eprintln!("__atuin_ai_insert__:{output}"),
+            Action::Print(output) => eprintln!("__atuin_ai_print__:{output}"),
+            Action::Cancel => eprintln!("__atuin_ai_cancel__"),
+        }
+    } else {
+        match action {
+            Action::Execute(output) => eprintln!("{output}"),
+            Action::Insert(output) => eprintln!("{output}"),
+            Action::Print(output) => eprintln!("{output}"),
+            Action::Cancel => eprintln!(),
+        }
     }
 }
 
@@ -329,280 +744,4 @@ fn wait_for_login_confirmation() -> Result<bool> {
             }
         }
     }
-}
-
-fn wait_for_retry_or_cancel() -> Result<bool> {
-    loop {
-        let ev = event::read().context("failed to read retry/cancel key")?;
-        if let Event::Key(key) = ev {
-            match key.code {
-                KeyCode::Enter | KeyCode::Char('r') => return Ok(true),
-                KeyCode::Esc => return Ok(false),
-                _ => {}
-            }
-        }
-    }
-}
-
-const SPINNER_FRAMES: [&str; 4] = ["/", "-", "\\", "|"];
-
-struct InlineUi {
-    terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
-    anchor_col: u16,
-}
-
-impl InlineUi {
-    fn new() -> Result<Self> {
-        let anchor_col = cursor::position().map(|(x, _)| x).unwrap_or(0);
-        enable_raw_mode().context("failed to enable raw mode for inline UI")?;
-        let backend = CrosstermBackend::new(std::io::stdout());
-        let terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(16),
-            },
-        )
-        .context("failed to initialize inline UI")?;
-        Ok(Self {
-            terminal,
-            anchor_col,
-        })
-    }
-
-    fn render_prompt(&mut self, prompt: &str) -> Result<()> {
-        self.render(Screen::Prompt {
-            prompt,
-            footer: "[Enter]: Accept  [Esc]: Cancel",
-        })
-    }
-
-    fn render_generating(&mut self, prompt: &str, spinner_idx: usize) -> Result<()> {
-        self.render(Screen::Generating {
-            prompt,
-            footer: "[Esc]: Cancel",
-            spinner_idx,
-        })
-    }
-
-    fn render_review(&mut self, prompt: &str, response: &GenerateResponse) -> Result<()> {
-        self.render(Screen::Review {
-            prompt,
-            response,
-            footer: "[Enter]: Run  [Tab]: Insert  [e]: Edit  [Esc]: Cancel",
-        })
-    }
-
-    fn render_error(&mut self, prompt: &str, err: &str) -> Result<()> {
-        self.render(Screen::Error {
-            prompt,
-            err,
-            footer: "[Enter]/[r]: Retry  [Esc]: Cancel",
-        })
-    }
-
-    fn render(&mut self, screen: Screen<'_>) -> Result<()> {
-        self.terminal
-            .draw(|f| draw_screen(f, screen, self.anchor_col))
-            .context("failed rendering inline UI")?;
-        Ok(())
-    }
-}
-
-impl Drop for InlineUi {
-    fn drop(&mut self) {
-        let _ = self.terminal.clear();
-        let _ = disable_raw_mode();
-    }
-}
-
-enum Screen<'a> {
-    Prompt {
-        prompt: &'a str,
-        footer: &'a str,
-    },
-    Generating {
-        prompt: &'a str,
-        footer: &'a str,
-        spinner_idx: usize,
-    },
-    Review {
-        prompt: &'a str,
-        response: &'a GenerateResponse,
-        footer: &'a str,
-    },
-    Error {
-        prompt: &'a str,
-        err: &'a str,
-        footer: &'a str,
-    },
-}
-
-fn draw_screen(frame: &mut Frame, screen: Screen<'_>, anchor_col: u16) {
-    let area = frame.area();
-    let desired_width = 64u16.min(area.width.saturating_sub(2)).max(32);
-    let content_width = usize::from(desired_width.saturating_sub(2)).max(1);
-    let (content_preview, _, _) = build_screen_content(&screen, content_width);
-    let desired_height = (wrapped_line_count(&content_preview, content_width) as u16)
-        .saturating_add(2)
-        .min(area.height.max(1))
-        .max(3);
-
-    let max_x = area.x + area.width.saturating_sub(desired_width);
-    let preferred_x = area.x + anchor_col.saturating_sub(2);
-    let card = Rect {
-        x: preferred_x.min(max_x),
-        y: area.y,
-        width: desired_width,
-        height: desired_height,
-    };
-
-    let footer = match &screen {
-        Screen::Prompt { footer, .. }
-        | Screen::Generating { footer, .. }
-        | Screen::Review { footer, .. }
-        | Screen::Error { footer, .. } => *footer,
-    };
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Describe the command you'd like to generate:")
-        .title_bottom(Line::from(footer).alignment(Alignment::Right));
-
-    let content_area = block.inner(card);
-    frame.render_widget(block, card);
-
-    let (content, show_cursor, cursor_prompt) =
-        build_screen_content(&screen, usize::from(content_area.width).max(1));
-
-    let paragraph = Paragraph::new(content).wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, content_area);
-
-    if show_cursor {
-        let width = usize::from(content_area.width).max(1);
-        let (cursor_row, cursor_col) =
-            prompt_cursor_position(cursor_prompt.as_deref().unwrap_or_default(), width);
-        let cursor_x = content_area.x.saturating_add(cursor_col);
-        let cursor_y = content_area.y.saturating_add(cursor_row);
-        frame.set_cursor_position((cursor_x, cursor_y));
-    }
-}
-
-fn format_prompt(prompt: &str) -> String {
-    if prompt.is_empty() {
-        return "> ".to_string();
-    }
-    format!("> {prompt}")
-}
-
-fn wrapped_line_count(text: &str, width: usize) -> usize {
-    if width == 0 {
-        return 1;
-    }
-
-    text.split('\n')
-        .map(|line| {
-            let len = line.chars().count();
-            len.max(1).div_ceil(width)
-        })
-        .sum::<usize>()
-        .max(1)
-}
-
-fn build_screen_content(
-    screen: &Screen<'_>,
-    content_width: usize,
-) -> (String, bool, Option<String>) {
-    match screen {
-        Screen::Prompt { prompt, .. } => {
-            let formatted = format_prompt(prompt);
-            (formatted, true, Some((*prompt).to_string()))
-        }
-        Screen::Generating {
-            prompt,
-            spinner_idx,
-            ..
-        } => (
-            format!(
-                "{}\n\n{} Generating...",
-                format_prompt(prompt),
-                SPINNER_FRAMES[*spinner_idx]
-            ),
-            false,
-            None,
-        ),
-        Screen::Review {
-            prompt, response, ..
-        } => {
-            let separator = "─".repeat(content_width.max(1));
-            let mut text = format!(
-                "{}\n\n{}\n\n$ {}\n",
-                format_prompt(prompt),
-                separator,
-                response.command
-            );
-            if let Some(explanation) = &response.explanation {
-                text.push('\n');
-                text.push_str(explanation);
-            }
-            (text, false, None)
-        }
-        Screen::Error { prompt, err, .. } => (
-            format!("{}\n\nRequest failed:\n{}", format_prompt(prompt), err),
-            false,
-            None,
-        ),
-    }
-}
-
-fn prompt_cursor_position(prompt: &str, width: usize) -> (u16, u16) {
-    if width == 0 {
-        return (0, 0);
-    }
-
-    // The visible prompt line is always `> {prompt}`.
-    // We mimic word-wrapping so cursor tracking matches visual layout.
-    let mut row = 0usize;
-    let mut col = 2usize; // "> "
-
-    let mut saw_any_word = false;
-    for word in prompt.split_whitespace() {
-        let word_len = word.chars().count();
-        if !saw_any_word {
-            saw_any_word = true;
-            if col + word_len <= width {
-                col += word_len;
-            } else if word_len >= width {
-                let used = width.saturating_sub(col);
-                let remaining = word_len.saturating_sub(used);
-                row += 1 + (remaining / width);
-                col = remaining % width;
-            } else {
-                row += 1;
-                col = word_len;
-            }
-            continue;
-        }
-
-        if col + 1 + word_len <= width {
-            col += 1 + word_len;
-        } else if word_len >= width {
-            row += 1 + (word_len / width);
-            col = word_len % width;
-        } else {
-            row += 1;
-            col = word_len;
-        }
-    }
-
-    // Keep trailing spaces user typed.
-    let trailing_spaces = prompt.chars().rev().take_while(|c| *c == ' ').count();
-    for _ in 0..trailing_spaces {
-        if col >= width {
-            row += 1;
-            col = 0;
-        }
-        col += 1;
-    }
-
-    (row as u16, col as u16)
 }
