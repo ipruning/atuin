@@ -4,13 +4,15 @@ Atuin AI is a subcommand that enables shell command generation and other informa
 
 Atuin AI requires an account on [Atuin Hub](https://hub.atuin.sh/), and you'll be prompted to login upon first use of the binary.
 
+Usage of Atuin AI is currently free.
+
 ## Getting Started
 
 Atuin AI currently supports zsh, bash, and fish shells. Your shell's usual `atuin init` call will automatically bind the question mark key to the Atuin AI UI (only when the prompt is empty).
 
 !!! note "Disabling Atuin AI"
 
-    You can disable the default question mark key binding by passing `--disable-ai` to your shell's `atuin init` call.
+    You can disable the default question mark key binding by passing `--disable-ai` to your shell's `atuin init` call, or by setting `ai.enabled` to `false` in your Atuin config.
 
 ## Settings
 
@@ -26,7 +28,7 @@ Prompt the LLM to create a command, and get one back, no fuss. Press `enter` to 
 
 ### Follow-up
 
-You can follow-up with a refinement prompt to update the command that will be inserted.
+You can follow-up with another prompt to update the command that will be inserted.
 
 [![Basic Atuin AI refinement usage](./images/basic-refine.png)](./images/basic-refine.png)
 

@@ -2,9 +2,12 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 
 use crate::context::{AppContext, ClientContext};
-use crate::tui::dispatch;
+use crate::driver::{DriverEvent, IoContext, ViewState, run_driver};
+use crate::fsm::AgentFsm;
+use crate::fsm::effects::ExitAction;
+use crate::session::{LocalSessionService, SessionManager, SessionService};
 use crate::tui::events::AiTuiEvent;
-use crate::tui::state::{ExitAction, Session};
+use crate::tui::state::ConversationEvent;
 use crate::tui::view::ai_view;
 use atuin_client::database::{Database, Sqlite};
 use eye_declare::{Application, CtrlCBehavior};
@@ -64,7 +67,7 @@ pub(crate) async fn run(
         settings.ai.opening.send_cwd.unwrap_or(false) || settings.ai.send_cwd.unwrap_or(false);
 
     let last_command = if settings.ai.opening.send_last_command.unwrap_or(false) {
-        history_db.last().await.ok().flatten().map(|h| h.command)
+        history_db.last().await.ok().flatten()
     } else {
         None
     };
@@ -81,9 +84,10 @@ pub(crate) async fn run(
         history_db: std::sync::Arc::new(history_db),
         git_root,
         capabilities: settings.ai.capabilities.clone(),
+        daemon_enabled: settings.daemon.enabled,
     };
 
-    let action = run_inline_tui(ctx, initial_command).await?;
+    let action = run_inline_tui(ctx, initial_command, settings).await?;
     emit_shell_result(action, output_for_hook);
 
     Ok(())
@@ -147,44 +151,174 @@ async fn ensure_hub_session(settings: &atuin_client::settings::Settings) -> Resu
 
 // ───────────────────────────────────────────────────────────────────
 
-async fn run_inline_tui(ctx: AppContext, initial_prompt: Option<String>) -> Result<Action> {
+async fn run_inline_tui(
+    ctx: AppContext,
+    initial_prompt: Option<String>,
+    settings: &atuin_client::settings::Settings,
+) -> Result<Action> {
     let client_ctx = ClientContext::detect();
 
-    let (tx, rx) = mpsc::channel::<AiTuiEvent>();
+    // Open the session service and check for a resumable session
+    let service = LocalSessionService::open(&settings.ai.db_path, settings.local_timeout)
+        .await
+        .context("failed to open AI session database")?;
 
-    let initial_state = Session::new(ctx.git_root.is_some());
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    let git_root_str = ctx
+        .git_root
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+
+    let session_window_mins = settings.ai.session_continue_minutes.max(0); // treat negative values as 0 to avoid confusion
+    let max_age_secs: i64 = session_window_mins * 60;
+
+    let resumable = service
+        .find_resumable(cwd.as_deref(), git_root_str.as_deref(), max_age_secs)
+        .await?;
+
+    // ─── Build FSM ───────────────────────────────────────────────
+    let (session_mgr, fsm, file_tracker, edit_permissions) = if let Some(stored) = resumable {
+        debug!(session_id = %stored.id, "resuming AI session");
+        let (mgr, mut events, server_sid, last_event_ts, invocation_id) =
+            SessionManager::resume(Box::new(service), &stored).await?;
+
+        let has_api_content = events.iter().any(|e| e.is_api_content());
+
+        if has_api_content {
+            events.push(ConversationEvent::SystemContext {
+                    content: "[Note: The user has started a new invocation of Atuin AI. Prior messages from this session are from an earlier invocation.]".to_string(),
+                });
+            let view_start = events.len();
+            let last_time = last_event_ts.and_then(|ts| chrono::DateTime::from_timestamp(ts, 0));
+
+            let ft = if let Ok(Some(json)) =
+                mgr.get_metadata(crate::file_tracker::METADATA_KEY).await
+                && let Ok(tracker) = crate::file_tracker::FileReadTracker::from_json(&json)
+            {
+                tracker
+            } else {
+                Default::default()
+            };
+
+            let ep = if let Ok(Some(json)) = mgr
+                .get_metadata(crate::edit_permissions::METADATA_KEY)
+                .await
+                && let Ok(cache) = crate::edit_permissions::EditPermissionCache::from_json(&json)
+            {
+                cache
+            } else {
+                Default::default()
+            };
+
+            let caps = ctx.capabilities_as_strings();
+            let fsm = AgentFsm::from_session(
+                events,
+                server_sid,
+                caps,
+                invocation_id,
+                view_start,
+                true,
+                last_time,
+            );
+            (mgr, fsm, ft, ep)
+        } else {
+            debug!("resumable session has no API-visible content, starting fresh");
+            let caps = ctx.capabilities_as_strings();
+            let fsm = AgentFsm::new(caps, invocation_id);
+            (mgr, fsm, Default::default(), Default::default())
+        }
+    } else {
+        debug!("creating new AI session");
+        let mgr =
+            SessionManager::create_new(Box::new(service), cwd.as_deref(), git_root_str.as_deref());
+        let invocation_id = uuid::Uuid::now_v7().to_string();
+        let caps = ctx.capabilities_as_strings();
+        let fsm = AgentFsm::new(caps, invocation_id);
+        (mgr, fsm, Default::default(), Default::default())
+    };
+
+    // ─── Snapshot store ─────────────────────────────────────────
+    let snapshot_dir = atuin_common::utils::data_dir()
+        .join("ai")
+        .join("snapshots")
+        .join(session_mgr.session_id());
+    let snapshot_store = crate::snapshots::SnapshotStore::open(snapshot_dir).ok();
+
+    let in_git_project = ctx.git_root.is_some();
+
+    // ─── Discover skills ───────────────────────────────────────
+    let project_root = ctx
+        .git_root
+        .clone()
+        .or_else(|| std::env::current_dir().ok());
+    let skill_registry = crate::skills::SkillRegistry::discover(project_root.as_deref()).await;
+
+    // ─── Build initial ViewState from FSM ───────────────────────
+    let initial_view = build_view_state(&fsm, in_git_project, &skill_registry);
+
+    // ─── Build IoContext ────────────────────────────────────────
+    let io = IoContext {
+        app_ctx: ctx.clone(),
+        client_ctx: client_ctx.clone(),
+        session_mgr,
+        file_tracker,
+        edit_permissions,
+        snapshot_store,
+        skill_registry,
+        user_context_cache: Default::default(),
+    };
+
+    // ─── Channel + Application ──────────────────────────────────
+    // Components emit DriverEvent::Tui(AiTuiEvent) via a wrapping sender.
+    // Spawned tasks emit DriverEvent::Fsm(Event) directly.
+    let (tx, rx) = mpsc::channel::<DriverEvent>();
+
+    // Wrap sender for components: they send AiTuiEvent, we wrap it
+    let tui_tx = DriverEventSender(tx.clone());
 
     println!();
 
-    // If there's an initial prompt, send it as a SubmitInput event
-    // so it flows through the same path as user-typed input.
     if let Some(prompt) = initial_prompt {
-        let _ = tx.send(AiTuiEvent::SubmitInput(prompt));
+        let _ = tui_tx
+            .0
+            .send(DriverEvent::Tui(AiTuiEvent::SubmitInput(prompt)));
     }
 
     let (mut app, handle) = Application::builder()
-        .state(initial_state)
+        .state(initial_view)
         .view(ai_view)
         .ctrl_c(CtrlCBehavior::Deliver)
         .keyboard_protocol(eye_declare::KeyboardProtocol::Enhanced)
         .bracketed_paste(true)
-        .with_context(tx.clone())
+        .with_context(tui_tx)
         .extra_newlines_at_exit(1)
+        .on_commit(|committed, state| {
+            if let Some(key) = &committed.key
+                && let Some(id_str) = key.strip_prefix("turn-")
+                && let Ok(id) = id_str.parse::<usize>()
+            {
+                let new_count = id + 1;
+                if new_count > state.committed_turn_count {
+                    state.committed_turn_count = new_count;
+                }
+            }
+        })
         .build()?;
 
-    // Event loop: receives AiTuiEvent from components, mutates state via Handle.
+    // ─── Driver loop ────────────────────────────────────────────
     let h = handle.clone();
-    tokio::task::spawn_blocking(move || {
-        let tx = tx.clone();
-        let client_ctx = client_ctx;
-        while let Ok(event) = rx.recv() {
-            dispatch::dispatch(&h, event, &tx, &ctx, &client_ctx);
-        }
+    let exiting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let exiting_clone = exiting.clone();
+    let dispatch_handle = tokio::task::spawn_blocking(move || {
+        run_driver(fsm, io, h, rx, tx, exiting_clone, in_git_project);
     });
 
-    app.run_loop().await?;
+    let run_result = app.run_loop().await;
+    let _ = dispatch_handle.await;
+    run_result?;
 
-    // Map exit action to return value
     let result = match app.state().exit_action {
         Some(ExitAction::Execute(ref cmd)) => Action::Execute(cmd.clone()),
         Some(ExitAction::Insert(ref cmd)) => Action::Insert(cmd.clone()),
@@ -192,6 +326,91 @@ async fn run_inline_tui(ctx: AppContext, initial_prompt: Option<String>) -> Resu
     };
 
     Ok(result)
+}
+
+/// Wrapper around `mpsc::Sender<DriverEvent>` that components use as context.
+///
+/// Components call `tx.send(AiTuiEvent::...)` via eye-declare's context system.
+/// This wrapper implements the same interface but wraps events in `DriverEvent::Tui`.
+#[derive(Debug, Clone)]
+pub(crate) struct DriverEventSender(pub mpsc::Sender<DriverEvent>);
+
+impl DriverEventSender {
+    pub fn send(&self, event: AiTuiEvent) -> Result<(), mpsc::SendError<AiTuiEvent>> {
+        self.0
+            .send(DriverEvent::Tui(event))
+            .map_err(|_| mpsc::SendError(AiTuiEvent::Exit))
+    }
+}
+
+/// Build a ViewState snapshot from FSM state. Used for the initial view
+/// and by the driver for ongoing sync.
+fn build_view_state(
+    fsm: &AgentFsm,
+    in_git_project: bool,
+    skill_registry: &crate::skills::SkillRegistry,
+) -> ViewState {
+    let safe_start = fsm.ctx.view_start_index.min(fsm.ctx.events.len());
+
+    let mut slash_registry = crate::tui::slash::SlashCommandRegistry::default();
+    let mut skill_names = std::collections::HashSet::new();
+    for skill in skill_registry.all() {
+        slash_registry.register(crate::tui::slash::SlashCommand::new(
+            &skill.name,
+            &skill.description,
+        ));
+        skill_names.insert(skill.name.clone());
+    }
+
+    let tools = fsm.ctx.tools.clone();
+    let visible_events = fsm.ctx.events[safe_start..].to_vec();
+    let archived_events = fsm.ctx.archived_events.clone();
+
+    let mut archived_builder = crate::tui::view::turn::TurnBuilder::new(&tools);
+    for event in &archived_events {
+        archived_builder.add_event(event);
+    }
+    let archived_turns = archived_builder.build();
+    let archived_turn_count = archived_turns.len();
+
+    let mut visible_builder =
+        crate::tui::view::turn::TurnBuilder::new_starting_at(&tools, archived_turn_count);
+    for event in &visible_events {
+        visible_builder.add_event(event);
+    }
+    let visible_turns = visible_builder.build();
+
+    let mut turns = archived_turns;
+    turns.extend(visible_turns);
+
+    let has_command = visible_events.iter().any(|e| {
+        matches!(e, ConversationEvent::ToolCall { name, input, .. }
+            if name == "suggest_command"
+                && input.get("command").and_then(|v| v.as_str()).is_some())
+    });
+
+    ViewState {
+        agent_state: fsm.state.clone(),
+        visible_events,
+        all_events: fsm.ctx.events.clone(),
+        session_id: fsm.ctx.session_id.clone(),
+        tools,
+        current_response: fsm.ctx.current_response.clone(),
+        is_resumed: fsm.ctx.is_resumed,
+        last_event_time: fsm.ctx.last_event_time,
+        in_git_project,
+        archived_events,
+        turns,
+        has_command,
+        committed_turn_count: 0,
+        archived_turn_count,
+        is_input_blank: true,
+        slash_command_input: None,
+        slash_command_search_results: Vec::new(),
+        exit_action: None,
+        slash_registry,
+        skill_names,
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -245,10 +464,8 @@ fn prompt_ai_setup() -> Result<SetupChoice> {
                 KeyCode::Up | KeyCode::Char('k') => {
                     selected = selected.saturating_sub(1);
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if selected < options.len() - 1 {
-                        selected += 1;
-                    }
+                KeyCode::Down | KeyCode::Char('j') if selected < options.len() - 1 => {
+                    selected += 1;
                 }
                 KeyCode::Enter => break,
                 KeyCode::Esc => {

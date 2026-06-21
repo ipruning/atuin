@@ -565,13 +565,6 @@ pub struct Search {
     /// The overall frecency score multiplier for the search index (default: 1.0).
     /// Applied after combining recency and frequency scores.
     pub frecency_score_multiplier: f64,
-
-    /// Filter history by author. Special values:
-    /// - `$all-user`: any author that is NOT a known AI agent (default)
-    /// - `$all-agent`: any known AI agent author
-    /// - literal strings like "ellie", "claude-code"
-    #[serde(default = "Search::default_authors")]
-    pub authors: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -671,6 +664,12 @@ pub struct Ai {
     /// Only necessary for custom AI endpoints.
     pub api_token: Option<String>,
 
+    /// Path to the AI sessions database.
+    pub db_path: String,
+
+    /// The maximum time in minutes that an AI session can be automatically resumed.
+    pub session_continue_minutes: i64,
+
     /// Deprecated: use opening.send_cwd instead. Kept for backwards compatibility.
     #[serde(default)]
     pub send_cwd: Option<bool>,
@@ -688,6 +687,12 @@ pub struct Ai {
 pub struct AiCapabilities {
     /// Whether the AI can request to search Atuin history. `None` = unset (defaults to enabled, and the ai will ask for permission).
     pub enable_history_search: Option<bool>,
+    /// Whether the AI can request to view the stored output, if any, for Atuin history entries. `None` = unset (defaults to enabled, and the ai will ask for permission).
+    pub enable_history_output: Option<bool>,
+    /// Whether the AI can request to read and write files. `None` = unset (defaults to enabled, and the ai will ask for permission).
+    pub enable_file_tools: Option<bool>,
+    /// Whether the AI can request to execute bash commands. `None` = unset (defaults to enabled, and the ai will ask for permission).
+    pub enable_command_execution: Option<bool>,
 }
 
 #[derive(Default, Clone, Debug, Deserialize, Serialize)]
@@ -851,14 +856,7 @@ impl Default for Search {
             recency_score_multiplier: 1.0,
             frequency_score_multiplier: 1.0,
             frecency_score_multiplier: 1.0,
-            authors: Self::default_authors(),
         }
-    }
-}
-
-impl Search {
-    fn default_authors() -> Vec<String> {
-        vec![crate::history::AUTHOR_FILTER_ALL_USER.to_string()]
     }
 }
 
@@ -1481,6 +1479,7 @@ impl Settings {
         let record_store_path = data_dir.join("records.db");
         let kv_path = data_dir.join("kv.db");
         let scripts_path = data_dir.join("scripts.db");
+        let ai_sessions_path = data_dir.join("ai_sessions.db");
         let socket_path = atuin_common::utils::runtime_dir().join("atuin.sock");
         let pidfile_path = data_dir.join("atuin-daemon.pid");
         let logs_dir = atuin_common::utils::logs_dir();
@@ -1564,6 +1563,8 @@ impl Settings {
             .set_default("search.frequency_score_multiplier", 1.0)?
             .set_default("search.frecency_score_multiplier", 1.0)?
             .set_default("meta.db_path", meta_path.to_str())?
+            .set_default("ai.db_path", ai_sessions_path.to_str())?
+            .set_default("ai.session_continue_minutes", 60)?
             .set_default("ai.send_cwd", false)?
             .set_default("ai.opening.send_cwd", false)?
             .set_default("ai.opening.send_last_command", false)?

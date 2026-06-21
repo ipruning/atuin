@@ -2,22 +2,21 @@
 // SSE streaming
 // ───────────────────────────────────────────────────────────────────
 
-use std::sync::mpsc;
-
+use atuin_client::history::History;
 use atuin_client::settings::AiCapabilities;
+
+use crate::context::history_output_capability_available;
 use atuin_common::tls::ensure_crypto_provider;
 
 use eventsource_stream::Eventsource;
-use eye_declare::Handle;
 use eyre::{Context, Result};
 use futures::StreamExt;
 use reqwest::Url;
+use reqwest::header::USER_AGENT;
 
-use crate::{
-    context::{AppContext, ClientContext},
-    tools::ClientToolCall,
-    tui::{Session, events::AiTuiEvent},
-};
+use crate::context::ClientContext;
+
+static APP_USER_AGENT: &str = concat!("atuin/", env!("CARGO_PKG_VERSION"));
 
 /// Frames that alter the stream lifecycle — terminal or state-changing.
 #[derive(Debug, Clone)]
@@ -40,12 +39,15 @@ pub(crate) enum StreamContent {
         tool_use_id: String,
         content: String,
         is_error: bool,
+        remote: bool,
+        content_length: Option<usize>,
     },
 }
 
 /// A frame from the SSE stream, classified as control or content.
 #[derive(Debug, Clone)]
 pub(crate) enum StreamFrame {
+    SessionIdentity(String),
     Content(StreamContent),
     Control(StreamControl),
 }
@@ -55,6 +57,7 @@ pub(crate) struct ChatRequest {
     pub messages: Vec<serde_json::Value>,
     pub session_id: Option<String>,
     pub capabilities: Vec<String>,
+    pub invocation_id: String,
 }
 
 impl ChatRequest {
@@ -62,10 +65,28 @@ impl ChatRequest {
         messages: Vec<serde_json::Value>,
         session_id: Option<String>,
         capabilities: &AiCapabilities,
+        history_output_available: bool,
+        invocation_id: String,
     ) -> Self {
-        let mut caps = vec![];
+        let mut caps = vec![
+            "client_invocations".to_string(),
+            "client_v1_load_skill".to_string(),
+        ];
         if capabilities.enable_history_search.unwrap_or(true) {
             caps.push("client_v1_atuin_history".to_string());
+        }
+        if capabilities.enable_file_tools.unwrap_or(true) {
+            caps.push("client_v1_read_file".to_string());
+            caps.push("client_v1_edit_file".to_string());
+            caps.push("client_v1_write_file".to_string());
+        }
+        if capabilities.enable_command_execution.unwrap_or(true) {
+            caps.push("client_v1_execute_shell_command".to_string());
+        }
+        if history_output_capability_available(history_output_available)
+            && capabilities.enable_history_output.unwrap_or(true)
+        {
+            caps.push("client_v1_atuin_output".to_string());
         }
         if let Ok(extra) = std::env::var("ATUIN_AI__ADDITIONAL_CAPS") {
             caps.extend(
@@ -80,17 +101,22 @@ impl ChatRequest {
             messages,
             session_id,
             capabilities: caps,
+            invocation_id,
         }
     }
 }
 
-fn create_chat_stream(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_chat_stream(
     hub_address: String,
     token: String,
     request: ChatRequest,
     client_ctx: ClientContext,
     send_cwd: bool,
-    last_command: Option<String>,
+    last_command: Option<History>,
+    user_contexts: Vec<crate::user_context::UserContext>,
+    skill_summaries: Vec<crate::skills::SkillSummary>,
+    skill_overflow: Option<String>,
 ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamFrame>> + Send>> {
     Box::pin(async_stream::stream! {
         ensure_crypto_provider();
@@ -104,12 +130,35 @@ fn create_chat_stream(
 
         tracing::debug!("Sending SSE request to {endpoint}");
 
-        let context = client_ctx.to_json(send_cwd, last_command.as_deref());
+        let context = client_ctx.to_json(send_cwd, last_command.as_ref());
+
+        let mut config = serde_json::json!({
+            "capabilities": request.capabilities,
+        });
+
+        if !user_contexts.is_empty() {
+            config["user_contexts"] = serde_json::json!(user_contexts);
+        }
+
+        if !skill_summaries.is_empty() {
+            config["skills"] = serde_json::json!(skill_summaries);
+            if let Some(ref overflow) = skill_overflow {
+                config["skills_overflow"] = serde_json::json!(overflow);
+            }
+        }
+
+        if let Ok(model) = std::env::var("ATUIN_AI__MODEL")
+            && !model.trim().is_empty() {
+                config["model"] = serde_json::json!(model.trim());
+
+        }
+
 
         let mut request_body = serde_json::json!({
             "messages": request.messages,
             "context": context,
-            "capabilities": request.capabilities,
+            "config": config,
+            "invocation_id": request.invocation_id
         });
 
         if let Some(ref sid) = request.session_id {
@@ -121,6 +170,7 @@ fn create_chat_stream(
         let response = match client
             .post(endpoint.clone())
             .header("Accept", "text/event-stream")
+            .header(USER_AGENT, APP_USER_AGENT)
             .bearer_auth(&token)
             .json(&request_body)
             .send()
@@ -146,6 +196,14 @@ fn create_chat_stream(
             yield Err(eyre::eyre!("SSE request failed ({}): {}", status, body));
             return;
         }
+
+        if let Some(sess_id) = response
+            .headers()
+            .get("x-atuin-ai-session-id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty()) {
+                yield Ok(StreamFrame::SessionIdentity(sess_id.to_string()));
+            }
 
         let byte_stream = response.bytes_stream();
         let mut stream = byte_stream.eventsource();
@@ -179,7 +237,9 @@ fn create_chat_stream(
                                 let tool_use_id = json.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let content = json.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let is_error = json.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
-                                yield Ok(StreamFrame::Content(StreamContent::ToolResult { tool_use_id, content, is_error }));
+                                let remote = json.get("remote").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let content_length = json.get("content_length").and_then(|v| v.as_u64()).map(|v| v as usize);
+                                yield Ok(StreamFrame::Content(StreamContent::ToolResult { tool_use_id, content, is_error, remote, content_length }));
                             }
                         }
                         "status" => {
@@ -222,141 +282,6 @@ fn create_chat_stream(
             }
         }
     })
-}
-
-// ───────────────────────────────────────────────────────────────────
-// Async streaming task — pushes updates to app state via Handle
-// ───────────────────────────────────────────────────────────────────
-
-pub(crate) async fn run_chat_stream(
-    handle: Handle<Session>,
-    tx: mpsc::Sender<AiTuiEvent>,
-    app_ctx: AppContext,
-    client_ctx: ClientContext,
-    request: ChatRequest,
-) {
-    let capabilities = request.capabilities.clone();
-    let stream = create_chat_stream(
-        app_ctx.endpoint.clone(),
-        app_ctx.token.clone(),
-        request,
-        client_ctx,
-        app_ctx.send_cwd,
-        app_ctx.last_command.clone(),
-    );
-    futures::pin_mut!(stream);
-
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(StreamFrame::Content(content)) => {
-                apply_content_frame(&handle, &tx, &capabilities, content);
-            }
-            Ok(StreamFrame::Control(control)) => {
-                let terminal = apply_control_frame(&handle, control);
-                if terminal {
-                    break;
-                }
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                handle.update(move |state| {
-                    state.streaming_error(msg);
-                });
-                break;
-            }
-        }
-    }
-}
-
-/// Apply a content frame to session state.
-/// Control flow: always continues the stream.
-fn apply_content_frame(
-    handle: &Handle<Session>,
-    tx: &mpsc::Sender<AiTuiEvent>,
-    capabilities: &[String],
-    content: StreamContent,
-) {
-    match content {
-        StreamContent::TextChunk(text) => {
-            handle.update(move |state| {
-                state.conversation.append_streaming_text(&text);
-            });
-        }
-        StreamContent::ToolCall { id, name, input } => {
-            if let Ok(tool) = ClientToolCall::try_from((name.as_str(), &input)) {
-                // Enforce capability gating: reject tool calls the client didn't advertise.
-                if let Some(required_cap) = tool.descriptor().capability
-                    && !capabilities.iter().any(|c| c == required_cap)
-                {
-                    tracing::warn!(
-                        tool = name,
-                        capability = required_cap,
-                        "Rejecting tool call: capability not advertised"
-                    );
-                    handle.update(move |state| {
-                        state.add_tool_call(id.clone(), name, input.clone());
-                        state.conversation.add_tool_result(
-                            id,
-                            format!("Tool not enabled: capability '{required_cap}' was not advertised by this client"),
-                            true,
-                        );
-                    });
-                    return;
-                }
-
-                // Client-side tool — add to tracker and conversation, queue permission check
-                let id_for_event = id.clone();
-                handle.update(move |state| {
-                    state.handle_client_tool_call(id_for_event, tool, input);
-                });
-                let _ = tx.send(AiTuiEvent::CheckToolCallPermission(id));
-            } else {
-                // Server-side tool — just add to conversation events
-                handle.update(move |state| {
-                    state.add_tool_call(id, name, input);
-                });
-            }
-        }
-        StreamContent::ToolResult {
-            tool_use_id,
-            content,
-            is_error,
-        } => {
-            handle.update(move |state| {
-                state
-                    .conversation
-                    .add_tool_result(tool_use_id, content, is_error);
-            });
-        }
-    }
-}
-
-/// Apply a control frame to session state.
-/// Returns true if the stream should terminate.
-fn apply_control_frame(handle: &Handle<Session>, control: StreamControl) -> bool {
-    match control {
-        StreamControl::StatusChanged(status) => {
-            handle.update(move |state| {
-                state.update_streaming_status(&status);
-            });
-            false
-        }
-        StreamControl::Done { session_id } => {
-            handle.update(move |state| {
-                if !session_id.is_empty() {
-                    state.conversation.store_session_id(session_id);
-                }
-                state.finalize_streaming();
-            });
-            true
-        }
-        StreamControl::Error(msg) => {
-            handle.update(move |state| {
-                state.streaming_error(msg);
-            });
-            true
-        }
-    }
 }
 
 fn hub_url(base: &str, path: &str) -> Result<Url> {

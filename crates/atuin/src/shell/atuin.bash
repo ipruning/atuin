@@ -20,6 +20,35 @@ fi
 ATUIN_STTY=$(stty -g)
 ATUIN_HISTORY_ID=""
 
+__atuin_osc133_command_executed() {
+    [[ -n "${ATUIN_PTY_PROXY_ACTIVE:-}" ]] || return
+    [[ -n "${ATUIN_HISTORY_ID:-}" && "$ATUIN_HISTORY_ID" != "__bash_preexec_failure__" ]] || return
+
+    printf '\033]133;C\a'
+}
+
+__atuin_osc133_command_finished() {
+    [[ -n "${ATUIN_PTY_PROXY_ACTIVE:-}" ]] || return
+    [[ -n "${ATUIN_HISTORY_ID:-}" && "$ATUIN_HISTORY_ID" != "__bash_preexec_failure__" ]] || return
+
+    printf '\033]133;D;%s;history_id=%s;session_id=%s\a' "$1" "$ATUIN_HISTORY_ID" "${ATUIN_SESSION:-}"
+}
+
+__atuin_osc133_prompt_start=$'\001\033]133;A;cl=line\a\002'
+__atuin_osc133_prompt_end=$'\001\033]133;B\a\002'
+
+__atuin_osc133_wrap_prompt() {
+    local __atuin_prompt="${PS1-}"
+    __atuin_prompt="${__atuin_prompt//$__atuin_osc133_prompt_start/}"
+    __atuin_prompt="${__atuin_prompt//$__atuin_osc133_prompt_end/}"
+
+    if [[ -n "${ATUIN_PTY_PROXY_ACTIVE:-}" ]]; then
+        PS1="${__atuin_osc133_prompt_start}${__atuin_prompt}${__atuin_osc133_prompt_end}"
+    else
+        PS1="$__atuin_prompt"
+    fi
+}
+
 export ATUIN_PREEXEC_BACKEND=$SHLVL:none
 __atuin_update_preexec_backend() {
     if [[ ${BLE_ATTACHED-} ]]; then
@@ -59,15 +88,19 @@ __atuin_preexec() {
     local id
     id=$(atuin history start -- "$1" 2>/dev/null)
     export ATUIN_HISTORY_ID=$id
+    [[ -n ${__atuin_skip_osc133:-} ]] || __atuin_osc133_command_executed
     __atuin_preexec_time=${EPOCHREALTIME-}
 }
 
 __atuin_precmd() {
     local EXIT=$? __atuin_precmd_time=${EPOCHREALTIME-}
 
+    __atuin_osc133_wrap_prompt
+
     [[ ! $ATUIN_HISTORY_ID ]] && return
 
     # If the previous preexec hook failed, we manually call __atuin_preexec
+    local __atuin_skip_osc133=""
     if [[ $ATUIN_HISTORY_ID == __bash_preexec_failure__ ]]; then
         # This is the command extraction code taken from bash-preexec
         local previous_command
@@ -75,6 +108,7 @@ __atuin_precmd() {
             export LC_ALL=C HISTTIMEFORMAT=''
             builtin history 1 | sed '1 s/^ *[0-9][0-9]*[* ] //'
         )
+        __atuin_skip_osc133=1
         __atuin_preexec "$previous_command"
     fi
 
@@ -106,6 +140,7 @@ __atuin_precmd() {
         fi
     fi
 
+    [[ -n ${__atuin_skip_osc133:-} ]] || __atuin_osc133_command_finished "$EXIT"
     (ATUIN_LOG=error atuin history end --exit "$EXIT" ${duration:+"--duration=$duration"} -- "$ATUIN_HISTORY_ID" &) >/dev/null 2>&1
     export ATUIN_HISTORY_ID=""
 }
@@ -297,7 +332,7 @@ __atuin_search_cmd() {
         __atuin_tmux_popup_cleanup
         trap - EXIT HUP INT TERM
     else
-        ATUIN_SHELL=bash ATUIN_LOG=error ATUIN_QUERY=$READLINE_LINE atuin search "${search_args[@]}" -i 3>&1 1>&2 2>&3
+        ATUIN_SHELL=bash ATUIN_LOG=error ATUIN_QUERY=$READLINE_LINE atuin search "${search_args[@]}" -i 3>&1 1>&2 2>&3 3>&-
     fi
 }
 
@@ -329,7 +364,10 @@ __atuin_history() {
         READLINE_LINE="" READLINE_POINT=0
 
     local __atuin_output
-    __atuin_output=$(__atuin_search_cmd "$@")
+    if ! __atuin_output=$(__atuin_search_cmd "$@"); then
+        [[ $__atuin_output ]] && printf '%s\n' "$__atuin_output" >&2
+        return 1
+    fi
 
     # We do nothing when the search is canceled.
     [[ $__atuin_output ]] || return 0

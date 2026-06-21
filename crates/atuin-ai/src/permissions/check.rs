@@ -1,13 +1,13 @@
 use eyre::Result;
 
-use crate::{permissions::file::RuleFile, tools::PermissableToolCall};
+use crate::{permissions::file::RuleFile, tools::PermissibleToolCall};
 
 pub(crate) struct PermissionRequest<'t> {
-    call: &'t (dyn PermissableToolCall + Send + Sync),
+    call: &'t (dyn PermissibleToolCall + Send + Sync),
 }
 
 impl<'t> PermissionRequest<'t> {
-    pub fn new(call: &'t (dyn PermissableToolCall + Send + Sync)) -> Self {
+    pub fn new(call: &'t (dyn PermissibleToolCall + Send + Sync)) -> Self {
         Self { call }
     }
 }
@@ -57,15 +57,12 @@ impl PermissionChecker {
                 }
             }
 
-            for rule in &file.content.permissions.allow {
-                if request.call.matches_rule(rule) {
-                    tracing::debug!(
-                        "Permission 'ALLOW' by rule: {} in file: {}",
-                        rule,
-                        file.path.display()
-                    );
-                    return Ok(PermissionResponse::Allowed);
-                }
+            if request.call.all_covered_by(&file.content.permissions.allow) {
+                tracing::debug!(
+                    "Permission 'ALLOW' by rules in file: {}",
+                    file.path.display()
+                );
+                return Ok(PermissionResponse::Allowed);
             }
         }
 
